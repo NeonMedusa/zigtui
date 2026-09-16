@@ -22,6 +22,7 @@ const sidebars: SidebarsConfig = {
         "widgets/bar-chart",
         "widgets/text-input",
         "widgets/choice-controls",
+        "widgets/date-picker",
         "widgets/spinner",
         "widgets/tree",
         "widgets/canvas",
