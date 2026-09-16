@@ -8,6 +8,16 @@ const sidebars: SidebarsConfig = {
       label: "Getting Started",
     },
     {
+      type: "doc",
+      id: "layout",
+      label: "Layout",
+    },
+    {
+      type: "doc",
+      id: "events",
+      label: "Events and Input",
+    },
+    {
       type: "category",
       label: "Widgets",
       collapsed: false,
@@ -34,6 +44,11 @@ const sidebars: SidebarsConfig = {
       type: "doc",
       id: "themes",
       label: "Themes",
+    },
+    {
+      type: "doc",
+      id: "unicode",
+      label: "Unicode",
     },
     {
       type: "doc",
