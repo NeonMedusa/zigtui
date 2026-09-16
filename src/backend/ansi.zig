@@ -515,6 +515,10 @@ pub const AnsiBackend = struct {
     }
 };
 
+test {
+    _ = ansi_input;
+}
+
 test "AnsiBackend basic" {
     if (is_windows) return error.SkipZigTest;
     // Basic smoke test - actual functionality requires a real terminal
