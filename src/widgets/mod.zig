@@ -9,19 +9,6 @@ pub const date_picker = @import("date_picker.zig");
 pub const Date = date_picker.Date;
 pub const DatePicker = date_picker.DatePicker;
 
-pub const Widget = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        render: *const fn (ptr: *anyopaque, area: Rect, buf: *Buffer) void,
-    };
-
-    pub fn render(self: Widget, area: Rect, buf: *Buffer) void {
-        self.vtable.render(self.ptr, area, buf);
-    }
-};
-
 pub const Borders = packed struct {
     top: bool = false,
     bottom: bool = false,
