@@ -19,21 +19,33 @@ pub fn parse(input: []const u8) ParseResult {
         return parseUtf8(input);
     }
 
-    // NOTE: A lone ESC is immediately returned as an esc key-press. This means
-    // a CSI u sequence (e.g. Shift+Enter -> ESC [ 1 3 ; 2 u) that is split
-    // across two reads with only the ESC byte in the first chunk will be
-    // misinterpreted as an esc key followed by literal characters. A
-    // timeout-based approach (wait briefly for more bytes) would resolve this
-    // but is left for a future improvement.
-    if (input.len == 1) {
-        return .{ .complete = .{ .event = .{ .key = .{ .code = .esc } }, .consumed = 1 } };
-    }
+    // A lone ESC is either the Esc key or the first byte of a sequence whose
+    // rest has not been read yet. Only waiting tells them apart, which is left
+    // to the caller; see `parseStale`.
+    if (input.len == 1) return .incomplete;
 
     switch (input[1]) {
         '[' => return parseCsi(input),
         'O' => return parseSs3(input),
         else => return parseAlt(input),
     }
+}
+
+/// Parse input that no more bytes are coming for, because the escape timeout
+/// passed without the terminal sending any. A lone ESC is then the Esc key, ESC
+/// plus one byte is that key with Alt held, and a longer sequence was cut short,
+/// so its ESC stands alone. Never returns `.incomplete` for non-empty input.
+pub fn parseStale(input: []const u8) ParseResult {
+    const result = parse(input);
+    if (result != .incomplete or input.len == 0) return result;
+
+    // A truncated UTF-8 sequence.
+    if (input[0] != 0x1b) return .{ .invalid = 1 };
+
+    if (input.len == 2) {
+        return .{ .complete = .{ .event = .{ .key = .{ .code = .{ .char = input[1] }, .modifiers = .{ .alt = true } } }, .consumed = 2 } };
+    }
+    return .{ .complete = .{ .event = .{ .key = .{ .code = .esc } }, .consumed = 1 } };
 }
 
 fn parseUtf8(input: []const u8) ParseResult {
@@ -549,4 +561,40 @@ test "parse SGR mouse right click with ctrl" {
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+fn expectKey(result: ParseResult, code: events.KeyCode, modifiers: events.KeyModifiers, consumed: usize) !void {
+    try std.testing.expect(result == .complete);
+    try std.testing.expectEqual(consumed, result.complete.consumed);
+    switch (result.complete.event) {
+        .key => |key| {
+            try std.testing.expectEqual(code, key.code);
+            try std.testing.expectEqual(modifiers, key.modifiers);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "lone ESC waits for the rest of a split sequence" {
+    try std.testing.expect(parse("\x1b") == .incomplete);
+    try expectKey(parse("\x1b[13;2u"), .enter, .{ .shift = true }, 7);
+}
+
+test "stale lone ESC is the Esc key" {
+    try expectKey(parseStale("\x1b"), .esc, .{}, 1);
+}
+
+test "stale ESC and one byte is that key with Alt" {
+    try expectKey(parseStale("\x1b["), .{ .char = '[' }, .{ .alt = true }, 2);
+    try expectKey(parseStale("\x1bO"), .{ .char = 'O' }, .{ .alt = true }, 2);
+}
+
+test "stale sequence cut short keeps only its ESC" {
+    try expectKey(parseStale("\x1b[1;5"), .esc, .{}, 1);
+}
+
+test "stale input that already parses is unchanged" {
+    try expectKey(parseStale("\x1b[A"), .up, .{}, 3);
+    try expectKey(parseStale("a"), .{ .char = 'a' }, .{}, 1);
+    try std.testing.expect(parseStale("\xE2\x82") == .invalid);
 }

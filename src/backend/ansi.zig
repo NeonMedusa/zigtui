@@ -36,6 +36,11 @@ pub const AnsiBackend = struct {
     in_alternate_screen: bool = false,
     write_buffer: std.ArrayListUnmanaged(u8) = .empty,
     input_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// How long a lone ESC waits for the rest of an escape sequence before it
+    /// counts as the Esc key. Raise it over slow links that split sequences.
+    escape_timeout_ms: u32 = 50,
+    /// When the incomplete bytes in `input_buffer` stop waiting for more.
+    escape_deadline: ?std.Io.Timestamp = null,
     keyboard_flags: u32 = 0,
     keyboard_push_pop: bool = false,
     keyboard_enabled: bool = false,
@@ -248,59 +253,82 @@ pub const AnsiBackend = struct {
                 };
                 return events.Event{ .resize = .{ .width = size.width, .height = size.height } };
             }
-            if (self.parseBufferedEvent()) |event| {
+            if (self.parseBufferedEvent(false)) |event| {
                 return event;
             }
 
-            // Use poll() for timeout support
-            var fds = [_]posix.pollfd{
-                .{
-                    .fd = self.stdin.handle,
-                    .events = posix.POLL.IN,
-                    .revents = 0,
-                },
-            };
+            const clock: std.Io.Clock = .awake;
+            const deadline = clock.now(self.io).addDuration(.fromMilliseconds(timeout_ms));
 
-            const poll_result = posix.poll(&fds, @intCast(timeout_ms)) catch |err| {
-                //sigwinch interupts poll()
-                if (err == error.Interrupted) {
-                    if (global_resize_flag.swap(false, .acquire)) {
-                        const size = getSize(@ptrCast(@alignCast(self))) catch {
-                            return events.Event.none;
-                        };
-                        return events.Event{ .resize = .{ .width = size.width, .height = size.height } };
+            while (true) {
+                var wait_ms = self.millisecondsUntil(deadline);
+
+                // Bytes still in the buffer are an escape sequence whose rest is
+                // on its way, or an Esc key press. Running out the escape
+                // timeout with nothing more read settles it as the key press.
+                var waiting_on_escape = false;
+                if (self.escape_deadline) |escape_deadline| {
+                    const escape_wait_ms = self.millisecondsUntil(escape_deadline);
+                    if (escape_wait_ms == 0) return self.parseBufferedEvent(true) orelse events.Event.none;
+                    if (escape_wait_ms <= wait_ms) {
+                        wait_ms = escape_wait_ms;
+                        waiting_on_escape = true;
                     }
                 }
-                return events.Event.none;
-            };
 
-            if (poll_result == 0) return events.Event.none;
+                // Use poll() for timeout support
+                var fds = [_]posix.pollfd{
+                    .{
+                        .fd = self.stdin.handle,
+                        .events = posix.POLL.IN,
+                        .revents = 0,
+                    },
+                };
 
-            if (fds[0].revents & posix.POLL.IN == 0) {
-                return events.Event.none;
+                const poll_result = posix.poll(&fds, @intCast(wait_ms)) catch |err| {
+                    //sigwinch interupts poll()
+                    if (err == error.Interrupted) {
+                        if (global_resize_flag.swap(false, .acquire)) {
+                            const size = getSize(@ptrCast(@alignCast(self))) catch {
+                                return events.Event.none;
+                            };
+                            return events.Event{ .resize = .{ .width = size.width, .height = size.height } };
+                        }
+                    }
+                    return events.Event.none;
+                };
+
+                if (poll_result == 0) {
+                    if (waiting_on_escape) return self.parseBufferedEvent(true) orelse events.Event.none;
+                    return events.Event.none;
+                }
+
+                if (fds[0].revents & posix.POLL.IN == 0) {
+                    return events.Event.none;
+                }
+
+                // Read available bytes
+                var buf: [64]u8 = undefined;
+                var vecs: [1][]u8 = .{&buf};
+                const n = self.stdin.readStreaming(self.io, &vecs) catch |err| switch (err) {
+                    error.WouldBlock, error.EndOfStream => return events.Event.none,
+                    else => return Error.IOError,
+                };
+
+                if (n == 0) return events.Event.none;
+
+                try self.input_buffer.appendSlice(self.allocator, buf[0..n]);
+                if (self.input_buffer.items.len > 4096) {
+                    self.consumeInput(self.input_buffer.items.len);
+                    return events.Event.none;
+                }
+
+                // New bytes restart the wait for whatever is still incomplete.
+                self.escape_deadline = null;
+                if (self.parseBufferedEvent(false)) |event| {
+                    return event;
+                }
             }
-
-            // Read available bytes
-            var buf: [64]u8 = undefined;
-            var vecs: [1][]u8 = .{&buf};
-            const n = self.stdin.readStreaming(self.io, &vecs) catch |err| switch (err) {
-                error.WouldBlock, error.EndOfStream => return events.Event.none,
-                else => return Error.IOError,
-            };
-
-            if (n == 0) return events.Event.none;
-
-            try self.input_buffer.appendSlice(self.allocator, buf[0..n]);
-            if (self.input_buffer.items.len > 4096) {
-                self.input_buffer.clearRetainingCapacity();
-                return events.Event.none;
-            }
-
-            if (self.parseBufferedEvent()) |event| {
-                return event;
-            }
-
-            return events.Event.none;
         }
 
         // Fallback for non-POSIX systems (should not reach here)
@@ -408,13 +436,8 @@ pub const AnsiBackend = struct {
         var supported = false;
 
         while (true) {
-            const remaining_ns = clock.now(self.io).durationTo(deadline).nanoseconds;
-            if (remaining_ns <= 0) break;
-            // Round up so a sub-millisecond remainder does not busy-spin poll().
-            const remaining_ms: u32 = @intCast(@min(
-                @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
-                @as(i96, timeout_ms),
-            ));
+            const remaining_ms = self.millisecondsUntil(deadline);
+            if (remaining_ms == 0) break;
 
             var fds = [_]posix.pollfd{
                 .{
@@ -486,15 +509,37 @@ pub const AnsiBackend = struct {
         buffer.replaceRange(undefined, start, clamped, &.{}) catch unreachable;
     }
 
-    fn parseBufferedEvent(self: *AnsiBackend) ?events.Event {
+    /// Milliseconds left until `deadline`, rounded up so a sub-millisecond
+    /// remainder does not busy-spin poll(). Zero once it has passed.
+    fn millisecondsUntil(self: *AnsiBackend, deadline: std.Io.Timestamp) u32 {
+        const clock: std.Io.Clock = .awake;
+        const remaining_ns = clock.now(self.io).durationTo(deadline).nanoseconds;
+        if (remaining_ns <= 0) return 0;
+        return @intCast(@min(
+            @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            std.math.maxInt(i32),
+        ));
+    }
+
+    /// Parse the next event out of `input_buffer`. With `stale` set, bytes that
+    /// would otherwise wait for more input are settled as they stand.
+    fn parseBufferedEvent(self: *AnsiBackend, stale: bool) ?events.Event {
         while (self.input_buffer.items.len > 0) {
-            switch (ansi_input.parse(self.input_buffer.items)) {
+            const input = self.input_buffer.items;
+            const result = if (stale) ansi_input.parseStale(input) else ansi_input.parse(input);
+            switch (result) {
                 .complete => |complete| {
                     self.consumeInput(complete.consumed);
                     if (complete.event == .none) continue;
                     return complete.event;
                 },
-                .incomplete => return null,
+                .incomplete => {
+                    if (self.escape_deadline == null) {
+                        const clock: std.Io.Clock = .awake;
+                        self.escape_deadline = clock.now(self.io).addDuration(.fromMilliseconds(self.escape_timeout_ms));
+                    }
+                    return null;
+                },
                 .invalid => |consumed| {
                     const drop_count = if (consumed == 0) 1 else consumed;
                     self.consumeInput(@min(drop_count, self.input_buffer.items.len));
@@ -506,6 +551,8 @@ pub const AnsiBackend = struct {
 
     fn consumeInput(self: *AnsiBackend, count: usize) void {
         if (count == 0 or self.input_buffer.items.len == 0) return;
+        // Whatever is left is a different prefix, so any wait starts over.
+        self.escape_deadline = null;
         if (count >= self.input_buffer.items.len) {
             self.input_buffer.clearRetainingCapacity();
             return;
