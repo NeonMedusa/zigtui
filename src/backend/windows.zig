@@ -5,6 +5,7 @@ const KeyboardProtocolOptions = @import("mod.zig").KeyboardProtocolOptions;
 const Error = @import("mod.zig").Error;
 const events = @import("../events/mod.zig");
 const render = @import("../render/mod.zig");
+const ansi_input = @import("ansi_input.zig");
 const restore = @import("../terminal/restore.zig");
 const Allocator = std.mem.Allocator;
 
@@ -216,38 +217,35 @@ fn combineSurrogates(hi: u16, lo: u16) ?u21 {
     return @intCast(0x10000 + ((@as(u21, hi) - 0xD800) << 10) + (@as(u21, lo) - 0xDC00));
 }
 
-/// Result of feeding one `KEY_EVENT_RECORD.UnicodeChar` code unit into the
-/// surrogate state machine.
-const SurrogateStep = union(enum) {
-    /// A leading surrogate was buffered; emit no event.
-    pending,
-    /// A complete code point is ready.
-    cp: u21,
-    /// Nothing to emit for this unit (trailing surrogate without a leader).
-    none,
-};
-
-/// UTF-16 input arrives as code units: a non-BMP character (emoji) is delivered
-/// as two consecutive KEY_EVENTs, a leading surrogate followed by a trailing
-/// one. `pending` holds the leading half across calls; `unit` is the code unit
-/// just read. `pending` is always left cleared unless a new leader was stored.
-fn resolveSurrogate(pending: *u16, unit: u16) SurrogateStep {
+/// 把一条 KEY_EVENT 的 `UnicodeChar`（UTF-16 码元）转换为应喂给输入解析器的
+/// UTF-8 字节，写入 `out` 并返回字节数（0 = 该记录被吞掉，如未配对的前导代理）。
+///
+/// 背景（ConPTY 实测）：conhost 的 VtInputThread 会先把收到的字节流按 UTF-8
+/// 解码为 UTF-16 再写入输入记录，因此记录**携带的永远是 UTF-16 码元**：
+/// - ASCII（≤ 0x7F）：码元值与字节相同，直接透传（控制序列/鼠标上报依赖此路径）；
+/// - BMP 非 ASCII（含中文）：UTF-8 编码后喂入；
+/// - 非 BMP（emoji 等）：以**前导+后继两条记录**到达，`pending_high` 缓存前导，
+///   与后继合并成完整码点后再编码（与微软 terminalInput.cpp 的 _leadingSurrogate
+///   逻辑一致）。代理码元单独编码会失败并被静默丢弃 → 输入/粘贴 emoji 无效；
+/// - U+0080–U+00FF（é、ü 等 Latin-1 补充）：若被当作"原始字节"透传，
+///   单字节不构成合法 UTF-8 序列，会静默丢弃该字符甚至吞掉后续字符；故统一编码。
+fn codeUnitToUtf8(pending_high: *u16, unit: u16, out: *[4]u8) usize {
+    if (unit == 0) return 0;
     if (unit >= 0xD800 and unit <= 0xDBFF) {
-        pending.* = unit;
-        return .pending;
+        pending_high.* = unit;
+        return 0;
     }
-    if (unit >= 0xDC00 and unit <= 0xDFFF) {
-        const hi = pending.*;
-        pending.* = 0;
-        if (hi != 0) {
-            if (combineSurrogates(hi, unit)) |cp| return .{ .cp = cp };
-        }
-        return .none;
+    var cp: u21 = unit;
+    if (pending_high.* != 0) {
+        const hi = pending_high.*;
+        pending_high.* = 0;
+        if (combineSurrogates(hi, unit)) |full| cp = full;
     }
-    // Any other unit: a stray leader never combines, so drop it and let the
-    // caller process this unit normally.
-    pending.* = 0;
-    return .none;
+    if (cp <= 0x7F) {
+        out[0] = @intCast(cp);
+        return 1;
+    }
+    return std.unicode.utf8Encode(cp, out) catch 0;
 }
 
 pub const WindowsBackend = struct {
@@ -260,8 +258,10 @@ pub const WindowsBackend = struct {
     in_alternate_screen: bool = false,
     mouse_enabled: bool = false,
     write_buffer: std.ArrayListUnmanaged(u8) = .empty,
-    /// Leading UTF-16 surrogate buffered while waiting for its trailing half
-    /// (see `resolveSurrogate`). 0 = none pending.
+    /// VT 输入字节流解析器（支持 bracketed paste）
+    input: ansi_input.Parser = .{},
+    /// 未配对的 UTF-16 前导代理（emoji 等非 BMP 字符分两条记录到达，
+    /// 需缓存前导再与后继合并；0 = 无）
     pending_high_surrogate: u16 = 0,
     original_console_info: CONSOLE_SCREEN_BUFFER_INFO = undefined,
     original_codepage: UINT = undefined,
@@ -326,6 +326,7 @@ pub const WindowsBackend = struct {
         }
 
         self.write_buffer.deinit(self.allocator);
+        self.input.deinit(self.allocator);
     }
 
     pub fn interface(self: *WindowsBackend) Backend {
@@ -363,18 +364,20 @@ pub const WindowsBackend = struct {
         stdin_mode &= ~ENABLE_LINE_INPUT;
         stdin_mode &= ~ENABLE_ECHO_INPUT;
         stdin_mode &= ~ENABLE_PROCESSED_INPUT;
-        stdin_mode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
         stdin_mode |= ENABLE_WINDOW_INPUT;
-        // Note: We explicitly disable ENABLE_VIRTUAL_TERMINAL_INPUT above.
-        // When enabled, Windows translates special keys (arrows, Tab, etc.) into
-        // ANSI escape sequences instead of providing virtual key codes directly.
-        // We want raw virtual key codes so we can handle them in pollEvent.
+        // 启用 VT 输入：按键与粘贴以 ANSI 字节流到达，
+        // 从而支持 bracketed paste（含多行粘贴不会被拆成回车）
+        stdin_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
         _ = SetConsoleMode(self.stdin_handle, stdin_mode);
 
         // Enable virtual terminal processing for stdout (ANSI escape sequences)
         var stdout_mode: DWORD = self.original_stdout_mode;
         stdout_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         _ = SetConsoleMode(self.stdout_handle, stdout_mode);
+
+        // 启用 bracketed paste：终端将粘贴内容用 ESC[200~..ESC[201~ 包裹，
+        // 同时 Windows Terminal 不再弹出多行粘贴警告
+        try writeDirectToConsole(self, "\x1b[?2004h");
 
         // Hand the console to `restore` so a panic or abnormal exit cannot
         // leave it in raw mode with mouse reporting on and the cursor hidden.
@@ -391,6 +394,9 @@ pub const WindowsBackend = struct {
         if (!self.in_raw_mode) return;
 
         if (!is_windows) return;
+
+        // 关闭 bracketed paste
+        writeDirectToConsole(self, "\x1b[?2004l") catch {};
 
         restore.disarm();
 
@@ -512,145 +518,78 @@ pub const WindowsBackend = struct {
             return events.Event.none;
         }
 
+        // 1. 先尝试从已缓冲的输入字节流解析事件
+        if (self.input.next(self.allocator)) |event| {
+            return event;
+        }
+
         // Wait for input with timeout
         const wait_result = WaitForSingleObject(self.stdin_handle, timeout_ms);
         if (wait_result == WAIT_TIMEOUT) {
+            // 超时不再有新字节：结算悬挂的 ESC 序列（单独 Esc / 被截断的序列），
+            // 与 ANSI 后端的 parseStale 超时路径保持一致
+            if (self.input.nextStale()) |event| return event;
             return events.Event.none;
         }
         if (wait_result != WAIT_OBJECT_0) {
             return events.Event.none;
         }
 
-        // Check if there are events available
-        var num_events: DWORD = 0;
-        if (!GetNumberOfConsoleInputEvents(self.stdin_handle, &num_events).toBool()) {
-            return events.Event.none;
+        // 2. 批量读取控制台记录，把按键/粘贴字节喂给解析器。
+        //    VT 输入模式下按键以 ANSI 字节流到达（如方向键 = ESC [ A），
+        //    粘贴则被 ESC[200~..ESC[201~ 包裹。一次读空队列可以避免
+        //    大段粘贴分多帧处理。
+        var resize_size: ?struct { width: u16, height: u16 } = null;
+        var read_count: usize = 0;
+        while (read_count < 65536) : (read_count += 1) {
+            var num_events: DWORD = 0;
+            if (!GetNumberOfConsoleInputEvents(self.stdin_handle, &num_events).toBool()) break;
+            if (num_events == 0) break;
+
+            var input_record: [1]INPUT_RECORD = undefined;
+            var events_read: DWORD = 0;
+            if (!ReadConsoleInputW(self.stdin_handle, &input_record, 1, &events_read).toBool()) break;
+            if (events_read == 0) break;
+
+            const record = input_record[0];
+            switch (record.EventType) {
+                KEY_EVENT => {
+                    const key_event = record.Event.KeyEvent;
+                    if (!key_event.bKeyDown.toBool()) continue; // 忽略抬起事件
+                    var utf8_buf: [4]u8 = undefined;
+                    const n = codeUnitToUtf8(&self.pending_high_surrogate, key_event.uChar.UnicodeChar, &utf8_buf);
+                    if (n == 0) continue; // 吞掉（未配对的前导代理 / 空码元）
+                    self.input.feed(self.allocator, utf8_buf[0..n]) catch return Error.IOError;
+                },
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    const size_event = record.Event.WindowBufferSizeEvent;
+                    resize_size = .{
+                        .width = @intCast(size_event.dwSize.X),
+                        .height = @intCast(size_event.dwSize.Y),
+                    };
+                },
+                FOCUS_EVENT => {
+                    const focus_event = record.Event.FocusEvent;
+                    const ev: events.Event = if (focus_event.bSetFocus.toBool())
+                        events.Event.focus_gained
+                    else
+                        events.Event.focus_lost;
+                    // 先解析已缓冲的按键事件，焦点事件留到下次轮询
+                    if (self.input.next(self.allocator)) |event| return event;
+                    return ev;
+                },
+                else => {},
+            }
         }
-        if (num_events == 0) {
-            return events.Event.none;
+
+        // 3. 从解析器取出事件
+        if (self.input.next(self.allocator)) |event| {
+            return event;
         }
-
-        // Read the input event
-        var input_record: [1]INPUT_RECORD = undefined;
-        var events_read: DWORD = 0;
-        if (!ReadConsoleInputW(self.stdin_handle, &input_record, 1, &events_read).toBool()) {
-            return events.Event.none;
+        if (resize_size) |s| {
+            return events.Event{ .resize = .{ .width = s.width, .height = s.height } };
         }
-        if (events_read == 0) {
-            return events.Event.none;
-        }
-
-        const record = input_record[0];
-
-        switch (record.EventType) {
-            KEY_EVENT => {
-                const key_event = record.Event.KeyEvent;
-                if (!key_event.bKeyDown.toBool()) {
-                    return events.Event.none; // Ignore key up events
-                }
-
-                const ctrl_pressed = (key_event.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-                const alt_pressed = (key_event.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
-                const shift_pressed = (key_event.dwControlKeyState & SHIFT_PRESSED) != 0;
-
-                const modifiers = events.KeyModifiers{
-                    .ctrl = ctrl_pressed,
-                    .alt = alt_pressed,
-                    .shift = shift_pressed,
-                };
-
-                // Non-BMP input (emoji) is split across two KEY_EVENTs; combine
-                // the surrogate halves before the code-unit guard below, which
-                // would otherwise reject both.
-                switch (resolveSurrogate(&self.pending_high_surrogate, key_event.uChar.UnicodeChar)) {
-                    .pending => return events.Event.none,
-                    .cp => |cp| return events.Event{ .key = .{ .code = .{ .char = cp }, .modifiers = modifiers } },
-                    .none => {},
-                }
-
-                // Map virtual key codes to KeyCode
-                const key_code: events.KeyCode = switch (key_event.wVirtualKeyCode) {
-                    VK_RETURN => .enter,
-                    VK_ESCAPE => .esc,
-                    VK_BACK => .backspace,
-                    VK_TAB => if (shift_pressed) .back_tab else .tab,
-                    VK_LEFT => .left,
-                    VK_RIGHT => .right,
-                    VK_UP => .up,
-                    VK_DOWN => .down,
-                    VK_DELETE => .delete,
-                    VK_HOME => .home,
-                    VK_END => .end,
-                    VK_PRIOR => .page_up,
-                    VK_NEXT => .page_down,
-                    VK_INSERT => .insert,
-                    VK_F1...VK_F1 + 11 => |vk| .{ .f = @intCast(vk - VK_F1 + 1) },
-                    else => blk: {
-                        // Use the Unicode character if available (surrogates
-                        // never reach this point; see `resolveSurrogate`).
-                        const unicode_char = key_event.uChar.UnicodeChar;
-                        if (unicode_char > 0 and (unicode_char < 0xD800 or unicode_char > 0xDFFF)) {
-                            break :blk .{ .char = unicode_char };
-                        }
-                        return events.Event.none;
-                    },
-                };
-
-                return events.Event{ .key = .{ .code = key_code, .modifiers = modifiers } };
-            },
-            WINDOW_BUFFER_SIZE_EVENT => {
-                const size_event = record.Event.WindowBufferSizeEvent;
-                return events.Event{ .resize = .{
-                    .width = @intCast(size_event.dwSize.X),
-                    .height = @intCast(size_event.dwSize.Y),
-                } };
-            },
-            MOUSE_EVENT => {
-                if (!self.mouse_enabled) return events.Event.none;
-                const me = record.Event.MouseEvent;
-
-                const ctrl_pressed = (me.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-                const alt_pressed = (me.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
-                const shift_pressed = (me.dwControlKeyState & SHIFT_PRESSED) != 0;
-                const modifiers = events.KeyModifiers{ .ctrl = ctrl_pressed, .alt = alt_pressed, .shift = shift_pressed };
-
-                const x: u16 = @intCast(me.dwMousePosition.X);
-                const y: u16 = @intCast(me.dwMousePosition.Y);
-
-                if (me.dwEventFlags & MOUSE_WHEELED != 0) {
-                    // High word of dwButtonState is wheel delta (signed)
-                    const delta: i16 = @bitCast(@as(u16, @intCast(me.dwButtonState >> 16)));
-                    const kind: events.MouseEventKind = if (delta > 0) .scroll_up else .scroll_down;
-                    return events.Event{ .mouse = .{ .kind = kind, .button = .left, .x = x, .y = y, .modifiers = modifiers } };
-                }
-
-                if (me.dwEventFlags & MOUSE_MOVED != 0) {
-                    return events.Event{ .mouse = .{ .kind = .moved, .button = .left, .x = x, .y = y, .modifiers = modifiers } };
-                }
-
-                const button: events.MouseButton = if (me.dwButtonState & FROM_LEFT_1ST_BUTTON_PRESSED != 0)
-                    .left
-                else if (me.dwButtonState & RIGHTMOST_BUTTON_PRESSED != 0)
-                    .right
-                else if (me.dwButtonState & FROM_LEFT_2ND_BUTTON_PRESSED != 0)
-                    .middle
-                else
-                    .left;
-
-                const kind: events.MouseEventKind = if (me.dwButtonState & (FROM_LEFT_1ST_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED) != 0) .down else .up;
-
-                return events.Event{ .mouse = .{ .kind = kind, .button = button, .x = x, .y = y, .modifiers = modifiers } };
-            },
-            FOCUS_EVENT => {
-                const focus_event = record.Event.FocusEvent;
-                if (focus_event.bSetFocus.toBool()) {
-                    return events.Event.focus_gained;
-                } else {
-                    return events.Event.focus_lost;
-                }
-            },
-            else => return events.Event.none,
-        }
+        return events.Event.none;
     }
 
     fn hideCursor(ptr: *anyopaque) Error!void {
@@ -711,10 +650,9 @@ pub const WindowsBackend = struct {
         const self: *WindowsBackend = @ptrCast(@alignCast(ptr));
         if (self.mouse_enabled) return;
         if (!is_windows) return;
-        var mode: DWORD = 0;
-        _ = GetConsoleMode(self.stdin_handle, &mode);
-        mode |= ENABLE_MOUSE_INPUT;
-        _ = SetConsoleMode(self.stdin_handle, mode);
+        // VT 输入模式下通过转义序列开启鼠标上报（SGR 扩展编码 + 按住拖动跟踪），
+        // 滚轮/点击/拖动会以 CSI < ... M/m 序列到达解析器
+        try writeDirectToConsole(self, "\x1b[?1002h\x1b[?1006h");
         self.mouse_enabled = true;
     }
 
@@ -722,10 +660,7 @@ pub const WindowsBackend = struct {
         const self: *WindowsBackend = @ptrCast(@alignCast(ptr));
         if (!self.mouse_enabled) return;
         if (!is_windows) return;
-        var mode: DWORD = 0;
-        _ = GetConsoleMode(self.stdin_handle, &mode);
-        mode &= ~ENABLE_MOUSE_INPUT;
-        _ = SetConsoleMode(self.stdin_handle, mode);
+        writeDirectToConsole(self, "\x1b[?1006l\x1b[?1000l") catch {};
         self.mouse_enabled = false;
     }
 };
@@ -742,32 +677,54 @@ test "combineSurrogates: valid pairs and boundaries" {
     try std.testing.expectEqual(@as(?u21, null), combineSurrogates(0xDC00, 0xDC00));
 }
 
-test "resolveSurrogate: pairs, stray leaders and lone trailers" {
+test "codeUnitToUtf8: ASCII 透传 / BMP 编码 / Latin-1 修复" {
     var pending: u16 = 0;
+    var buf: [4]u8 = undefined;
 
-    // 😀 U+1F600: leader is buffered, trailer completes it
-    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
+    // ASCII：单字节透传（控制序列/鼠标上报依赖此路径）
+    try std.testing.expectEqual(@as(usize, 1), codeUnitToUtf8(&pending, 0x1B, &buf));
+    try std.testing.expectEqual(@as(u8, 0x1B), buf[0]);
+    try std.testing.expectEqual(@as(usize, 1), codeUnitToUtf8(&pending, 'a', &buf));
+    try std.testing.expectEqual(@as(u8, 'a'), buf[0]);
+
+    // 中文（BMP 非 ASCII）：UTF-8 编码
+    try std.testing.expectEqual(@as(usize, 3), codeUnitToUtf8(&pending, 0x4E2D, &buf));
+    try std.testing.expectEqualSlices(u8, "中", buf[0..3]);
+
+    // Latin-1 补充（é U+00E9）：若按原始字节透传会丢字符，应编码为 C3 A9
+    try std.testing.expectEqual(@as(usize, 2), codeUnitToUtf8(&pending, 0x00E9, &buf));
+    try std.testing.expectEqualSlices(u8, "é", buf[0..2]);
+
+    // 空码元：吞掉
+    try std.testing.expectEqual(@as(usize, 0), codeUnitToUtf8(&pending, 0, &buf));
+}
+
+test "codeUnitToUtf8: 代理对（emoji）跨记录合并 / 孤立前导清理" {
+    var pending: u16 = 0;
+    var buf: [4]u8 = undefined;
+
+    // 😀 U+1F600：前导记录被吞掉并缓存，后继记录合并为完整编码
+    try std.testing.expectEqual(@as(usize, 0), codeUnitToUtf8(&pending, 0xD83D, &buf));
     try std.testing.expectEqual(@as(u16, 0xD83D), pending);
-    try std.testing.expectEqual(SurrogateStep{ .cp = 0x1F600 }, resolveSurrogate(&pending, 0xDE00));
+    try std.testing.expectEqual(@as(usize, 4), codeUnitToUtf8(&pending, 0xDE00, &buf));
+    try std.testing.expectEqualSlices(u8, "😀", buf[0..4]);
     try std.testing.expectEqual(@as(u16, 0), pending);
 
-    // Stray leader followed by a normal character: leader is dropped, the
-    // character is processed normally by the caller
-    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
-    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 'x'));
+    // 孤立前导 + 普通字符：前导被清理，字符正常处理
+    try std.testing.expectEqual(@as(usize, 0), codeUnitToUtf8(&pending, 0xD83D, &buf));
+    try std.testing.expectEqual(@as(usize, 1), codeUnitToUtf8(&pending, 'x', &buf));
+    try std.testing.expectEqual(@as(u8, 'x'), buf[0]);
     try std.testing.expectEqual(@as(u16, 0), pending);
 
-    // Lone trailer: nothing to emit, no state left behind
-    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 0xDE00));
+    // 孤立后继（无前导）：编码失败被吞、无残留状态
+    try std.testing.expectEqual(@as(usize, 0), codeUnitToUtf8(&pending, 0xDE00, &buf));
     try std.testing.expectEqual(@as(u16, 0), pending);
 
-    // Two leaders in a row: the second replaces the first
-    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
-    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83C));
-    try std.testing.expectEqual(@as(u16, 0xD83C), pending);
-    // 🏏 U+1F3CF = D83C DFCF
-    try std.testing.expectEqual(SurrogateStep{ .cp = 0x1F3CF }, resolveSurrogate(&pending, 0xDFCF));
-
-    // Plain ASCII passes through the machine untouched
-    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 'a'));
+    // 连续两个 emoji：状态正确复位
+    _ = codeUnitToUtf8(&pending, 0xD83D, &buf);
+    try std.testing.expectEqual(@as(usize, 4), codeUnitToUtf8(&pending, 0xDE80, &buf));
+    try std.testing.expectEqualSlices(u8, "🚀", buf[0..4]);
+    _ = codeUnitToUtf8(&pending, 0xD83D, &buf);
+    try std.testing.expectEqual(@as(usize, 4), codeUnitToUtf8(&pending, 0xDE00, &buf));
+    try std.testing.expectEqualSlices(u8, "😀", buf[0..4]);
 }

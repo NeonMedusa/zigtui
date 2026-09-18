@@ -69,10 +69,12 @@ fn parseUtf8(input: []const u8) ParseResult {
 
 fn parseAsciiControl(byte: u8) events.Event {
     return switch (byte) {
-        '\r', '\n' => .{ .key = .{ .code = .enter } },
+        '\r' => .{ .key = .{ .code = .enter } },
+        // LF（Ctrl+J）：作为换行字符交给应用处理，而不是当成回车
+        '\n' => .{ .key = .{ .code = .{ .char = '\n' } } },
         '\t' => .{ .key = .{ .code = .tab } },
-        127 => .{ .key = .{ .code = .backspace } },
-        1...8, 11...12, 14...26 => |ctrl| .{
+        8, 127 => .{ .key = .{ .code = .backspace } },
+        1...7, 11...12, 14...26 => |ctrl| .{
             .key = .{
                 .code = .{ .char = @as(u21, ctrl - 1 + 'a') },
                 .modifiers = .{ .ctrl = true },
@@ -597,4 +599,269 @@ test "stale input that already parses is unchanged" {
     try expectKey(parseStale("\x1b[A"), .up, .{}, 3);
     try expectKey(parseStale("a"), .{ .char = 'a' }, .{}, 1);
     try std.testing.expect(parseStale("\xE2\x82") == .invalid);
+}
+
+// ── 有状态解析器：bracketed paste（DECSET 2004）支持 ──
+
+const paste_start = "\x1b[200~";
+const paste_end = "\x1b[201~";
+const max_parser_buffer = 1 << 20; // 1 MiB
+
+/// 流式输入解析器：累积字节并逐个产出事件。
+/// 在 `parse()` 之上增加了 bracketed paste 的状态管理：
+/// 终端以 `ESC[200~ ... ESC[201~` 包裹粘贴内容时，产出单个 `.paste` 事件，
+/// 其中的换行不会退化成为 Enter 按键。
+pub const Parser = struct {
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    paste_payload: std.ArrayListUnmanaged(u8) = .empty,
+    in_paste: bool = false,
+
+    pub fn deinit(self: *Parser, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
+        self.paste_payload.deinit(allocator);
+    }
+
+    /// 追加原始输入字节
+    pub fn feed(self: *Parser, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        try self.buffer.appendSlice(allocator, bytes);
+        if (self.buffer.items.len > max_parser_buffer) {
+            // 防御：异常膨胀的未解析缓冲直接丢弃
+            self.buffer.clearRetainingCapacity();
+            self.in_paste = false;
+            self.paste_payload.clearRetainingCapacity();
+        }
+    }
+
+    /// 尝试解析下一个事件；null 表示需要更多数据。
+    /// 返回 `.paste` 时，其切片在下次调用 next()/feed() 前有效。
+    pub fn next(self: *Parser, allocator: std.mem.Allocator) ?events.Event {
+        while (true) {
+            if (self.in_paste) {
+                if (std.mem.indexOf(u8, self.buffer.items, paste_end)) |pos| {
+                    self.paste_payload.appendSlice(allocator, self.buffer.items[0..pos]) catch {
+                        self.discardPaste();
+                        return null;
+                    };
+                    self.consume(pos + paste_end.len);
+                    self.in_paste = false;
+                    return .{ .paste = normalizePasteLineEndings(self.paste_payload.items) };
+                }
+                // 未遇到结束标记：收集除"结束标记前缀"之外的字节
+                const keep = paste_end.len - 1;
+                if (self.buffer.items.len > keep) {
+                    const take = self.buffer.items.len - keep;
+                    self.paste_payload.appendSlice(allocator, self.buffer.items[0..take]) catch {
+                        self.discardPaste();
+                        return null;
+                    };
+                    self.consume(take);
+                }
+                if (self.paste_payload.items.len > max_parser_buffer) {
+                    self.discardPaste();
+                }
+                return null;
+            }
+
+            if (std.mem.indexOf(u8, self.buffer.items, paste_start)) |pos| {
+                if (pos == 0) {
+                    self.consume(paste_start.len);
+                    self.in_paste = true;
+                    self.paste_payload.clearRetainingCapacity();
+                    continue;
+                }
+                // 标记之前还有普通输入：先处理前缀
+                switch (parse(self.buffer.items[0..pos])) {
+                    .complete => |c| {
+                        self.consume(c.consumed);
+                        return c.event;
+                    },
+                    .invalid => |consumed| {
+                        self.consume(@max(consumed, 1));
+                        continue;
+                    },
+                    .incomplete => {
+                        self.consume(1);
+                        continue;
+                    },
+                }
+            }
+
+            switch (parse(self.buffer.items)) {
+                .incomplete => return null,
+                .invalid => |consumed| {
+                    self.consume(@max(consumed, 1));
+                    continue;
+                },
+                .complete => |c| {
+                    self.consume(c.consumed);
+                    return c.event;
+                },
+            }
+        }
+    }
+
+    /// 读取超时（不再有新字节）时调用：把悬挂的 ESC/截断序列按最终含义结算，
+    /// 与 ANSI 后端的 parseStale 路径一致；粘贴进行中不结算（分块到达是正常的）。
+    pub fn nextStale(self: *Parser) ?events.Event {
+        if (self.in_paste) return null;
+        while (self.buffer.items.len > 0) {
+            switch (parseStale(self.buffer.items)) {
+                .complete => |c| {
+                    self.consume(c.consumed);
+                    return c.event;
+                },
+                .invalid => |consumed| {
+                    self.consume(@max(consumed, 1));
+                    continue;
+                },
+                .incomplete => return null,
+            }
+        }
+        return null;
+    }
+
+    fn discardPaste(self: *Parser) void {
+        self.in_paste = false;
+        self.paste_payload.clearRetainingCapacity();
+    }
+
+    fn consume(self: *Parser, n: usize) void {
+        const take = @min(n, self.buffer.items.len);
+        if (take == 0) return;
+        const rest = self.buffer.items.len - take;
+        std.mem.copyForwards(u8, self.buffer.items[0..rest], self.buffer.items[take..]);
+        self.buffer.shrinkRetainingCapacity(rest);
+    }
+};
+
+/// 规范化粘贴内容的换行：CRLF 与孤立 CR 统一为 LF。
+/// Windows 剪贴板行尾是 CRLF，而某些终端只把 CR 透传给应用。
+fn normalizePasteLineEndings(payload: []u8) []u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (payload[i] == '\r') {
+            payload[w] = '\n';
+            w += 1;
+            i += 1;
+            if (i < payload.len and payload[i] == '\n') i += 1; // 吞掉 CRLF 中的 LF
+            continue;
+        }
+        payload[w] = payload[i];
+        w += 1;
+        i += 1;
+    }
+    return payload[0..w];
+}
+
+test "Parser: bracketed paste 输出单个 paste 事件" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    try p.feed(std.testing.allocator, "ab\x1b[200~line1\nline2\nline3\x1b[201~cd");
+
+    // 先出 'a'
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| try std.testing.expectEqual(@as(u21, 'a'), k.code.char),
+        else => return error.TestExpectedEqual,
+    }
+    // 再出 'b'
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| try std.testing.expectEqual(@as(u21, 'b'), k.code.char),
+        else => return error.TestExpectedEqual,
+    }
+    // 然后是粘贴事件（内容原样保留换行）
+    switch (p.next(std.testing.allocator).?) {
+        .paste => |text| try std.testing.expectEqualStrings("line1\nline2\nline3", text),
+        else => return error.TestExpectedEqual,
+    }
+    // 最后是 'c'
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| try std.testing.expectEqual(@as(u21, 'c'), k.code.char),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Parser: 粘贴分块到达也能正确拼接" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    try p.feed(std.testing.allocator, "\x1b[20");
+    try std.testing.expect(p.next(std.testing.allocator) == null);
+    try p.feed(std.testing.allocator, "0~hello\nwor");
+    try std.testing.expect(p.next(std.testing.allocator) == null);
+    try p.feed(std.testing.allocator, "ld\x1b[201");
+    try std.testing.expect(p.next(std.testing.allocator) == null);
+    try p.feed(std.testing.allocator, "~");
+
+    switch (p.next(std.testing.allocator).?) {
+        .paste => |text| try std.testing.expectEqualStrings("hello\nworld", text),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Parser: Ctrl+J(LF) 作为换行字符而非回车" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    try p.feed(std.testing.allocator, "\r\n");
+    // Enter
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| try std.testing.expectEqual(events.KeyCode.enter, k.code),
+        else => return error.TestExpectedEqual,
+    }
+    // LF → char '\n'
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| try std.testing.expectEqual(@as(u21, '\n'), k.code.char),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Parser: 粘贴内容中的 CRLF 与 CR 规范化为 LF" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    // 模拟 Windows 剪贴板 CRLF，以及某些终端只透传 CR 的情况
+    try p.feed(std.testing.allocator, "\x1b[200~line1\r\nline2\rline3\x1b[201~");
+    switch (p.next(std.testing.allocator).?) {
+        .paste => |text| try std.testing.expectEqualStrings("line1\nline2\nline3", text),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Parser: 悬挂的 ESC 在超时后结算为 Esc" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    try p.feed(std.testing.allocator, "\x1b");
+    try std.testing.expect(p.next(std.testing.allocator) == null);
+    switch (p.nextStale().?) {
+        .key => |k| try std.testing.expectEqual(events.KeyCode.esc, k.code),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expect(p.nextStale() == null);
+
+    // Alt+键 一次到达 → alt 修饰
+    try p.feed(std.testing.allocator, "\x1bx");
+    switch (p.next(std.testing.allocator).?) {
+        .key => |k| {
+            try std.testing.expectEqual(@as(u21, 'x'), k.code.char);
+            try std.testing.expect(k.modifiers.alt);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Parser: 粘贴进行中超时不清算" {
+    var p = Parser{};
+    defer p.deinit(std.testing.allocator);
+
+    try p.feed(std.testing.allocator, "\x1b[200~partial");
+    try std.testing.expect(p.next(std.testing.allocator) == null);
+    try std.testing.expect(p.nextStale() == null);
+    try p.feed(std.testing.allocator, "\x1b[201~");
+    switch (p.next(std.testing.allocator).?) {
+        .paste => |text| try std.testing.expectEqualStrings("partial", text),
+        else => return error.TestExpectedEqual,
+    }
 }
