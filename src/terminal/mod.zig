@@ -34,6 +34,14 @@ pub const Terminal = struct {
     next_buffer: Buffer,
     output: std.ArrayListUnmanaged(u8) = .empty,
     hidden_cursor: bool = false,
+    /// 帧尾要定位到的终端光标（0 基列、行；null = 不改变）。
+    /// 由宿主在 render 回调内设置：作为帧的**最后一条指令**随同步块一起写出，
+    /// 保证终端每帧只渲染一次且渲染时光标已在正确位置。
+    /// （独立走 Win32 SetConsoleCursorPosition 会与帧字节流形成两条通道，时序不可控，
+    /// IME 组合串/候选窗会在"最后写入格子"与目标位置间闪烁）
+    pending_cursor: ?[2]u16 = null,
+    /// 上一帧已定位的光标（用于判断是否需要单纯因光标移动而输出）
+    last_cursor: ?[2]u16 = null,
 
     pub fn init(allocator: Allocator, backend_impl: Backend) !Terminal {
         const size = try backend_impl.getSize();
@@ -149,13 +157,25 @@ pub const Terminal = struct {
             }
         }
 
-        if (self.output.items.len == 0) return;
+        // 终端光标定位：并入帧尾（同步块内最后一条指令）。
+        // pending_cursor 与上一帧不同时，即使无格子变化也需输出（否则光标停留旧位置）。
+        const cursor_changed = if (self.pending_cursor) |p|
+            (self.last_cursor == null or !std.meta.eql(p, self.last_cursor.?))
+        else
+            false;
+        if (self.output.items.len == 0 and !cursor_changed) return;
 
         try self.output.appendSlice(alloc, "\x1b[0m");
+        if (self.pending_cursor) |p| {
+            var cur_buf: [24]u8 = undefined;
+            const cur_cmd = std.fmt.bufPrint(&cur_buf, "\x1b[{d};{d}H", .{ p[1] + 1, p[0] + 1 }) catch unreachable;
+            try self.output.appendSlice(alloc, cur_cmd);
+        }
         try self.backend_impl.write(sync_begin);
         try self.backend_impl.write(self.output.items);
         try self.backend_impl.write(sync_end);
         try self.backend_impl.flush();
+        self.last_cursor = self.pending_cursor;
 
         @memcpy(self.current_buffer.cells, next.cells);
     }
@@ -262,3 +282,120 @@ pub const Terminal = struct {
         @memset(self.current_buffer.cells, .{ .char = 0 });
     }
 };
+
+// ── 测试：帧尾光标定位（含 mock backend） ──
+
+const testing = std.testing;
+
+const MockBackend = struct {
+    written: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+
+    fn enterRawMode(_: *anyopaque) Error!void {}
+    fn exitRawMode(_: *anyopaque) Error!void {}
+    fn enableAlternateScreen(_: *anyopaque) Error!void {}
+    fn disableAlternateScreen(_: *anyopaque) Error!void {}
+    fn clearScreen(ptr: *anyopaque) Error!void {
+        _ = ptr;
+    }
+    fn write(ptr: *anyopaque, data: []const u8) Error!void {
+        const self: *MockBackend = @ptrCast(@alignCast(ptr));
+        self.written.appendSlice(testing.allocator, data) catch return Error.OutOfMemory;
+    }
+    fn flush(_: *anyopaque) Error!void {}
+    fn getSize(_: *anyopaque) Error!render.Size {
+        return .{ .width = 20, .height = 5 };
+    }
+    fn pollEvent(_: *anyopaque, _: u32) Error!@import("../events/mod.zig").Event {
+        return .none;
+    }
+    fn hideCursor(_: *anyopaque) Error!void {}
+    fn showCursor(_: *anyopaque) Error!void {}
+    fn setCursor(_: *anyopaque, _: u16, _: u16) Error!void {}
+    fn enableKeyboardProtocol(_: *anyopaque, _: KeyboardProtocolOptions) Error!void {}
+    fn disableKeyboardProtocol(_: *anyopaque) Error!void {}
+    fn enableMouse(_: *anyopaque) Error!void {}
+    fn disableMouse(_: *anyopaque) Error!void {}
+
+    const vtable = Backend.VTable{
+        .enter_raw_mode = enterRawMode,
+        .exit_raw_mode = exitRawMode,
+        .enable_alternate_screen = enableAlternateScreen,
+        .disable_alternate_screen = disableAlternateScreen,
+        .clear_screen = clearScreen,
+        .write = write,
+        .flush = flush,
+        .get_size = getSize,
+        .poll_event = pollEvent,
+        .hide_cursor = hideCursor,
+        .show_cursor = showCursor,
+        .set_cursor = setCursor,
+        .enable_keyboard_protocol = enableKeyboardProtocol,
+        .disable_keyboard_protocol = disableKeyboardProtocol,
+        .enable_mouse = enableMouse,
+        .disable_mouse = disableMouse,
+    };
+};
+
+test "flush emits pending cursor as the last instruction inside the sync block" {
+    var mock = MockBackend{};
+    defer mock.written.deinit(testing.allocator);
+
+    const be = Backend{ .ptr = &mock, .vtable = &MockBackend.vtable };
+    var term = try Terminal.init(testing.allocator, be);
+    defer term.deinit();
+
+    // 第一帧：写内容 + 光标定位
+    mock.written.clearRetainingCapacity();
+    const Ctx = struct { term: *Terminal };
+    try term.draw(Ctx{ .term = &term }, struct {
+        fn render(ctx: Ctx, buf: *Buffer) !void {
+            buf.setString(0, 0, "hi", .{});
+            ctx.term.pending_cursor = .{ 3, 2 }; // 0 基坐标 (3,2) → 序列应为 CSI 3;4 H
+        }
+    }.render);
+    const out1 = mock.written.items;
+    const cursor_seq = "\x1b[3;4H";
+    const pos_cursor = std.mem.indexOf(u8, out1, cursor_seq) orelse
+        return error.TestExpectedCursorSequence;
+    const pos_sync_end = std.mem.lastIndexOf(u8, out1, sync_end) orelse
+        return error.TestExpectedSyncEnd;
+    const pos_sync_begin = std.mem.lastIndexOf(u8, out1, sync_begin) orelse
+        return error.TestExpectedSyncBegin;
+    // 定位在同步块内、且是块内最后一条指令（sync_begin < cursor < sync_end）
+    try testing.expect(pos_sync_begin < pos_cursor);
+    try testing.expect(pos_cursor < pos_sync_end);
+    // 帧内容与定位同处一个同步块（渲染一次完成，不与独立通道交错）
+    try testing.expect(std.mem.indexOf(u8, out1[0..pos_sync_end], "hi") != null);
+
+    // 第二帧：无格子差异、仅光标移动 → 仍需输出定位
+    mock.written.clearRetainingCapacity();
+    try term.draw(Ctx{ .term = &term }, struct {
+        fn render(ctx: Ctx, buf: *Buffer) !void {
+            // 重画同样的 "hi"，无差异
+            buf.setString(0, 0, "hi", .{});
+            ctx.term.pending_cursor = .{ 5, 1 };
+        }
+    }.render);
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[2;6H") != null);
+
+    // 第三帧：光标与格子都不变 → 不输出
+    mock.written.clearRetainingCapacity();
+    try term.draw(Ctx{ .term = &term }, struct {
+        fn render(ctx: Ctx, buf: *Buffer) !void {
+            buf.setString(0, 0, "hi", .{});
+            ctx.term.pending_cursor = .{ 5, 1 };
+        }
+    }.render);
+    try testing.expectEqual(@as(usize, 0), mock.written.items.len);
+
+    // 第四帧：不再定位（pending_cursor = null）→ 只输出格子差异，无定位序列
+    mock.written.clearRetainingCapacity();
+    try term.draw(Ctx{ .term = &term }, struct {
+        fn render(ctx: Ctx, buf: *Buffer) !void {
+            buf.setString(0, 0, "yo", .{});
+            ctx.term.pending_cursor = null;
+        }
+    }.render);
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "yo") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[2;6H") == null);
+}
