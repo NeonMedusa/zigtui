@@ -13,6 +13,7 @@ const leave_sequence =
     "\x1b[<u" ++
     "\x1b[?7h" ++
     "\x1b[0m" ++
+    "\x1b[0 q" ++
     "\x1b[?25h" ++
     "\x1b[?1049l";
 

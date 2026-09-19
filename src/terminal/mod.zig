@@ -23,6 +23,10 @@ pub var ambiguous_advance: u2 = 1;
 const enter_sequence = "\x1b[?7l";
 const exit_sequence = "\x1b[?7h";
 
+/// 把应用请求过的光标形状复位为用户默认（DECSCUSR 0）；
+/// restore.zig 的 leave_sequence 中有同样的复位（panic/信号路径）。
+const reset_cursor_shape = "\x1b[0 q";
+
 /// Terminals that understand this hold the frame back until it is complete;
 /// the rest ignore the private mode. Either way the frame is never torn.
 const sync_begin = "\x1b[?2026h";
@@ -73,6 +77,7 @@ pub const Terminal = struct {
         if (self.hidden_cursor) {
             self.backend_impl.showCursor() catch {};
         }
+        self.backend_impl.write(reset_cursor_shape) catch {};
         self.backend_impl.write(exit_sequence) catch {};
         self.backend_impl.flush() catch {};
         self.backend_impl.disableAlternateScreen() catch {};
@@ -250,6 +255,27 @@ pub const Terminal = struct {
         try self.backend_impl.setCursor(x, y);
     }
 
+    /// 终端光标形状（DECSCUSR，`CSI Ps SP q`）。不支持的终端会忽略该序列（无副作用）。
+    /// 宿主在需要时设置（如输入状态用方块）；退出/panic 路径由 deinit / restore 复位为默认。
+    pub const CursorShape = enum(u8) {
+        /// 终端/用户配置的默认形状
+        default = 0,
+        blinking_block = 1,
+        steady_block = 2,
+        blinking_underline = 3,
+        steady_underline = 4,
+        blinking_bar = 5,
+        steady_bar = 6,
+    };
+
+    /// 请求终端改变光标形状（立即写出）。
+    pub fn setCursorShape(self: *Terminal, shape: CursorShape) !void {
+        var buf: [8]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "\x1b[{d} q", .{@intFromEnum(shape)}) catch unreachable;
+        try self.backend_impl.write(cmd);
+        try self.backend_impl.flush();
+    }
+
     pub fn enableKeyboardProtocol(self: *Terminal, options: KeyboardProtocolOptions) !void {
         try self.backend_impl.enableKeyboardProtocol(options);
     }
@@ -398,4 +424,25 @@ test "flush emits pending cursor as the last instruction inside the sync block" 
     }.render);
     try testing.expect(std.mem.indexOf(u8, mock.written.items, "yo") != null);
     try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[2;6H") == null);
+}
+
+test "setCursorShape writes DECSCUSR through the backend" {
+    var mock = MockBackend{};
+    defer mock.written.deinit(testing.allocator);
+    const be = Backend{ .ptr = &mock, .vtable = &MockBackend.vtable };
+    var term = try Terminal.init(testing.allocator, be);
+    // 本测试手动 deinit（需断言 deinit 的复位输出），因此不使用 defer
+
+    mock.written.clearRetainingCapacity();
+    try term.setCursorShape(.blinking_block);
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[1 q") != null);
+
+    mock.written.clearRetainingCapacity();
+    try term.setCursorShape(.default);
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[0 q") != null);
+
+    // deinit 会复位形状（0 q），保证退出后终端回到用户默认
+    mock.written.clearRetainingCapacity();
+    term.deinit();
+    try testing.expect(std.mem.indexOf(u8, mock.written.items, "\x1b[0 q") != null);
 }
