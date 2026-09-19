@@ -1,6 +1,7 @@
 const std = @import("std");
 const backend = @import("../backend/mod.zig");
 const render = @import("../render/mod.zig");
+const width_mod = @import("../render/width.zig");
 const style = @import("../style/mod.zig");
 const Allocator = std.mem.Allocator;
 const Backend = backend.Backend;
@@ -9,6 +10,13 @@ const Buffer = render.Buffer;
 
 pub const Error = backend.Error;
 pub const restore = @import("restore.zig");
+
+/// 终端对「模糊宽度」字符（①←≤…等）实际推进的列数。
+/// 1 = 只推进 1 列（Windows Terminal + 默认字体实测）：flush 会显式补写续格空格，
+/// 把终端光标强制对齐到"2 列"坐标系；
+/// 2 = 按全角推进 2 列（终端使用 CJK 等宽字体等）：与普通宽字符一样处理、无需补格。
+/// 仅当 width.ambiguous_width == .wide 时生效；pub 供宿主按终端能力覆盖。
+pub var ambiguous_advance: u2 = 1;
 
 /// Turning autowrap off keeps a glyph in the last column from scrolling the
 /// screen, which would otherwise desynchronize every tracked cursor position.
@@ -124,6 +132,16 @@ pub const Terminal = struct {
                 }
 
                 try appendChar(&self.output, alloc, cell.char);
+
+                // 缓冲记账 2 列、但终端实际只推进 1 列（模糊宽度字符、或被 wide
+                // 覆盖名单提宽的窄字符）：显式在续格写一个空格，把终端光标对齐到
+                // 2 列坐标系。否则后续内容会整体左移一列，重绘时错位、留下残影。
+                if (advance == 2 and width_mod.terminalAdvance(cell.char, ambiguous_advance == 2) == 1) {
+                    var cont_buf: [24]u8 = undefined;
+                    const cont_cmd = std.fmt.bufPrint(&cont_buf, "\x1b[{d};{d}H", .{ y + 1, x + 2 }) catch unreachable;
+                    try self.output.appendSlice(alloc, cont_cmd);
+                    try self.output.append(alloc, ' ');
+                }
 
                 last_x = x + advance;
                 last_y = y;

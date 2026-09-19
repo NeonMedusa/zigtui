@@ -250,6 +250,186 @@ const wide = [_]Range{
     .{ .lo = 0x30000, .hi = 0x3FFFD },
 };
 
+/// East Asian Width = Ambiguous（模糊宽度）。宽度由终端/字体决定：
+/// 实测 Windows Terminal + 默认字体下，终端对这些字符的“记账”是 1 列，
+/// 但字形常按全角设计（比格子宽约 1px），相邻时圆圈互相挤压。
+/// 这里统一按 2 列处理（CJK 传统语义），并由 Terminal.flush 显式补续格空格
+/// 强制对齐光标（见 terminal/mod.zig 的 ambiguous_advance）。
+/// 例外（保持 1 列）：盒绘线 0x2500-0x257F 与块元素 0x2580-0x259F——
+/// 传统半角，且本 TUI 的边框/工具块直接依赖它们占 1 列。
+/// 数据源：Unicode 18.0 EastAsianWidth.txt，剔除组合记号/格式/私用/未分配/FFFD。
+const ambiguous = [_]Range{
+    .{ .lo = 0xA1, .hi = 0xA1 },
+    .{ .lo = 0xA4, .hi = 0xA4 },
+    .{ .lo = 0xA7, .hi = 0xA8 },
+    .{ .lo = 0xAA, .hi = 0xAA },
+    .{ .lo = 0xAE, .hi = 0xAE },
+    .{ .lo = 0xB0, .hi = 0xB4 },
+    .{ .lo = 0xB6, .hi = 0xBA },
+    .{ .lo = 0xBC, .hi = 0xBF },
+    .{ .lo = 0xC6, .hi = 0xC6 },
+    .{ .lo = 0xD0, .hi = 0xD0 },
+    .{ .lo = 0xD7, .hi = 0xD8 },
+    .{ .lo = 0xDE, .hi = 0xE1 },
+    .{ .lo = 0xE6, .hi = 0xE6 },
+    .{ .lo = 0xE8, .hi = 0xEA },
+    .{ .lo = 0xEC, .hi = 0xED },
+    .{ .lo = 0xF0, .hi = 0xF0 },
+    .{ .lo = 0xF2, .hi = 0xF3 },
+    .{ .lo = 0xF7, .hi = 0xFA },
+    .{ .lo = 0xFC, .hi = 0xFC },
+    .{ .lo = 0xFE, .hi = 0xFE },
+    .{ .lo = 0x101, .hi = 0x101 },
+    .{ .lo = 0x111, .hi = 0x111 },
+    .{ .lo = 0x113, .hi = 0x113 },
+    .{ .lo = 0x11B, .hi = 0x11B },
+    .{ .lo = 0x126, .hi = 0x127 },
+    .{ .lo = 0x12B, .hi = 0x12B },
+    .{ .lo = 0x131, .hi = 0x133 },
+    .{ .lo = 0x138, .hi = 0x138 },
+    .{ .lo = 0x13F, .hi = 0x142 },
+    .{ .lo = 0x144, .hi = 0x144 },
+    .{ .lo = 0x148, .hi = 0x14B },
+    .{ .lo = 0x14D, .hi = 0x14D },
+    .{ .lo = 0x152, .hi = 0x153 },
+    .{ .lo = 0x166, .hi = 0x167 },
+    .{ .lo = 0x16B, .hi = 0x16B },
+    .{ .lo = 0x1CE, .hi = 0x1CE },
+    .{ .lo = 0x1D0, .hi = 0x1D0 },
+    .{ .lo = 0x1D2, .hi = 0x1D2 },
+    .{ .lo = 0x1D4, .hi = 0x1D4 },
+    .{ .lo = 0x1D6, .hi = 0x1D6 },
+    .{ .lo = 0x1D8, .hi = 0x1D8 },
+    .{ .lo = 0x1DA, .hi = 0x1DA },
+    .{ .lo = 0x1DC, .hi = 0x1DC },
+    .{ .lo = 0x251, .hi = 0x251 },
+    .{ .lo = 0x261, .hi = 0x261 },
+    .{ .lo = 0x2C4, .hi = 0x2C4 },
+    .{ .lo = 0x2C7, .hi = 0x2C7 },
+    .{ .lo = 0x2C9, .hi = 0x2CB },
+    .{ .lo = 0x2CD, .hi = 0x2CD },
+    .{ .lo = 0x2D0, .hi = 0x2D0 },
+    .{ .lo = 0x2D8, .hi = 0x2DB },
+    .{ .lo = 0x2DD, .hi = 0x2DD },
+    .{ .lo = 0x2DF, .hi = 0x2DF },
+    .{ .lo = 0x391, .hi = 0x3A1 },
+    .{ .lo = 0x3A3, .hi = 0x3A9 },
+    .{ .lo = 0x3B1, .hi = 0x3C1 },
+    .{ .lo = 0x3C3, .hi = 0x3C9 },
+    .{ .lo = 0x401, .hi = 0x401 },
+    .{ .lo = 0x410, .hi = 0x44F },
+    .{ .lo = 0x451, .hi = 0x451 },
+    .{ .lo = 0x2010, .hi = 0x2010 },
+    .{ .lo = 0x2013, .hi = 0x2016 },
+    .{ .lo = 0x2018, .hi = 0x2019 },
+    .{ .lo = 0x201C, .hi = 0x201D },
+    .{ .lo = 0x2020, .hi = 0x2022 },
+    .{ .lo = 0x2024, .hi = 0x2027 },
+    .{ .lo = 0x2030, .hi = 0x2030 },
+    .{ .lo = 0x2032, .hi = 0x2033 },
+    .{ .lo = 0x2035, .hi = 0x2035 },
+    .{ .lo = 0x203B, .hi = 0x203B },
+    .{ .lo = 0x203E, .hi = 0x203E },
+    .{ .lo = 0x2074, .hi = 0x2074 },
+    .{ .lo = 0x207F, .hi = 0x207F },
+    .{ .lo = 0x2081, .hi = 0x2084 },
+    .{ .lo = 0x20AC, .hi = 0x20AC },
+    .{ .lo = 0x2103, .hi = 0x2103 },
+    .{ .lo = 0x2105, .hi = 0x2105 },
+    .{ .lo = 0x2109, .hi = 0x2109 },
+    .{ .lo = 0x2113, .hi = 0x2113 },
+    .{ .lo = 0x2116, .hi = 0x2116 },
+    .{ .lo = 0x2121, .hi = 0x2122 },
+    .{ .lo = 0x2126, .hi = 0x2126 },
+    .{ .lo = 0x212B, .hi = 0x212B },
+    .{ .lo = 0x2153, .hi = 0x2154 },
+    .{ .lo = 0x215B, .hi = 0x215E },
+    .{ .lo = 0x2160, .hi = 0x216B },
+    .{ .lo = 0x2170, .hi = 0x2179 },
+    .{ .lo = 0x2189, .hi = 0x2189 },
+    .{ .lo = 0x2190, .hi = 0x2199 },
+    .{ .lo = 0x21B8, .hi = 0x21B9 },
+    .{ .lo = 0x21D2, .hi = 0x21D2 },
+    .{ .lo = 0x21D4, .hi = 0x21D4 },
+    .{ .lo = 0x21E7, .hi = 0x21E7 },
+    .{ .lo = 0x2200, .hi = 0x2200 },
+    .{ .lo = 0x2202, .hi = 0x2203 },
+    .{ .lo = 0x2207, .hi = 0x2208 },
+    .{ .lo = 0x220B, .hi = 0x220B },
+    .{ .lo = 0x220F, .hi = 0x220F },
+    .{ .lo = 0x2211, .hi = 0x2211 },
+    .{ .lo = 0x2215, .hi = 0x2215 },
+    .{ .lo = 0x221A, .hi = 0x221A },
+    .{ .lo = 0x221D, .hi = 0x2220 },
+    .{ .lo = 0x2223, .hi = 0x2223 },
+    .{ .lo = 0x2225, .hi = 0x2225 },
+    .{ .lo = 0x2227, .hi = 0x222C },
+    .{ .lo = 0x222E, .hi = 0x222E },
+    .{ .lo = 0x2234, .hi = 0x2237 },
+    .{ .lo = 0x223C, .hi = 0x223D },
+    .{ .lo = 0x2248, .hi = 0x2248 },
+    .{ .lo = 0x224C, .hi = 0x224C },
+    .{ .lo = 0x2252, .hi = 0x2252 },
+    .{ .lo = 0x2260, .hi = 0x2261 },
+    .{ .lo = 0x2264, .hi = 0x2267 },
+    .{ .lo = 0x226A, .hi = 0x226B },
+    .{ .lo = 0x226E, .hi = 0x226F },
+    .{ .lo = 0x2282, .hi = 0x2283 },
+    .{ .lo = 0x2286, .hi = 0x2287 },
+    .{ .lo = 0x2295, .hi = 0x2295 },
+    .{ .lo = 0x2299, .hi = 0x2299 },
+    .{ .lo = 0x22A5, .hi = 0x22A5 },
+    .{ .lo = 0x22BF, .hi = 0x22BF },
+    .{ .lo = 0x2312, .hi = 0x2312 },
+    .{ .lo = 0x2460, .hi = 0x24E9 },
+    .{ .lo = 0x24EB, .hi = 0x24FF },
+    .{ .lo = 0x25A0, .hi = 0x25A1 },
+    .{ .lo = 0x25A3, .hi = 0x25A9 },
+    .{ .lo = 0x25B2, .hi = 0x25B3 },
+    .{ .lo = 0x25B6, .hi = 0x25B7 },
+    .{ .lo = 0x25BC, .hi = 0x25BD },
+    .{ .lo = 0x25C0, .hi = 0x25C1 },
+    .{ .lo = 0x25C6, .hi = 0x25C8 },
+    .{ .lo = 0x25CB, .hi = 0x25CB },
+    .{ .lo = 0x25CE, .hi = 0x25D1 },
+    .{ .lo = 0x25E2, .hi = 0x25E5 },
+    .{ .lo = 0x25EF, .hi = 0x25EF },
+    .{ .lo = 0x2605, .hi = 0x2606 },
+    .{ .lo = 0x2609, .hi = 0x2609 },
+    .{ .lo = 0x260E, .hi = 0x260F },
+    .{ .lo = 0x261C, .hi = 0x261C },
+    .{ .lo = 0x261E, .hi = 0x261E },
+    .{ .lo = 0x2640, .hi = 0x2640 },
+    .{ .lo = 0x2642, .hi = 0x2642 },
+    .{ .lo = 0x2660, .hi = 0x2661 },
+    .{ .lo = 0x2663, .hi = 0x2665 },
+    .{ .lo = 0x2667, .hi = 0x266A },
+    .{ .lo = 0x266C, .hi = 0x266D },
+    .{ .lo = 0x266F, .hi = 0x266F },
+    .{ .lo = 0x269E, .hi = 0x269F },
+    .{ .lo = 0x26BF, .hi = 0x26BF },
+    .{ .lo = 0x26C6, .hi = 0x26CD },
+    .{ .lo = 0x26CF, .hi = 0x26D3 },
+    .{ .lo = 0x26D5, .hi = 0x26E1 },
+    .{ .lo = 0x26E3, .hi = 0x26E3 },
+    .{ .lo = 0x26E8, .hi = 0x26E9 },
+    .{ .lo = 0x26EB, .hi = 0x26F1 },
+    .{ .lo = 0x26F4, .hi = 0x26F4 },
+    .{ .lo = 0x26F6, .hi = 0x26F9 },
+    .{ .lo = 0x26FB, .hi = 0x26FC },
+    .{ .lo = 0x26FE, .hi = 0x26FF },
+    .{ .lo = 0x273D, .hi = 0x273D },
+    .{ .lo = 0x2776, .hi = 0x277F },
+    .{ .lo = 0x2B56, .hi = 0x2B59 },
+    .{ .lo = 0x3248, .hi = 0x324F },
+    .{ .lo = 0x1F100, .hi = 0x1F10A },
+    .{ .lo = 0x1F110, .hi = 0x1F12D },
+    .{ .lo = 0x1F130, .hi = 0x1F169 },
+    .{ .lo = 0x1F170, .hi = 0x1F18D },
+    .{ .lo = 0x1F18F, .hi = 0x1F190 },
+    .{ .lo = 0x1F19B, .hi = 0x1F1AC },
+};
+
 fn inRanges(ranges: []const Range, cp: u21) bool {
     var lo: usize = 0;
     var hi: usize = ranges.len;
@@ -267,11 +447,29 @@ fn inRanges(ranges: []const Range, cp: u21) bool {
     return false;
 }
 
+/// 「模糊宽度」策略：按 2 列（CJK 传统）还是 1 列（多数终端/其他库的默认，如
+/// string-width 的 ambiguousIsNarrow、OpenTUI/opencode 的实现）处理。
+/// 本 vendored fork 默认 .wide 保持既有行为；SkyNet 启动时按配置覆盖：
+/// config.json 的 ambiguous_width（wide/narrow/auto）。
+pub const AmbiguousWidth = enum { wide, narrow };
+pub var ambiguous_width: AmbiguousWidth = .wide;
+
 pub fn codepointWidth(cp: u21) u2 {
     if (cp < 0x20 or (cp >= 0x7F and cp < 0xA0)) return 0;
-    if (cp < 0x300) return 1;
+    // 用户覆盖优先于一切（含 ASCII 快速路径；无覆盖名单时零开销）
+    if (wide_override_count > 0 and inSortedList(wide_overrides[0..wide_override_count], cp)) return 2;
+    if (cp < 0xA0) return 1;
     if (inRanges(&zero_width, cp)) return 0;
+    if (narrow_override_count > 0 and inSortedList(narrow_overrides[0..narrow_override_count], cp)) {
+        // 真宽字符终端固定渲染 2 列：narrow 覆盖无法生效，保持 2 列与终端一致
+        if (inRanges(&wide, cp)) return 2;
+        return 1;
+    }
     if (inRanges(&wide, cp)) return 2;
+    if (inRanges(&ambiguous, cp)) return switch (ambiguous_width) {
+        .wide => 2,
+        .narrow => 1,
+    };
     return 1;
 }
 
@@ -291,6 +489,56 @@ pub fn decodeCharAt(bytes: []const u8, index: usize) DecodedChar {
 
 /// Display width of `bytes` in columns. Malformed UTF-8 counts as the
 /// replacement character (one column), matching how it is rendered.
+
+/// 是否属于「模糊宽度」字符类（与当前策略无关；策略见 ambiguous_width）。
+pub fn isAmbiguous(cp: u21) bool {
+    return inRanges(&ambiguous, cp);
+}
+
+/// 用户宽度覆盖名单：wide 强制 2 列、narrow 强制 1 列（真宽字符除外，见 codepointWidth）。
+/// 由宿主（SkyNet）在启动时按 config.json 的 width_overrides 设置。
+pub const max_width_overrides = 1024;
+
+var wide_overrides: [max_width_overrides]u21 = [_]u21{0} ** max_width_overrides;
+var wide_override_count: usize = 0;
+var narrow_overrides: [max_width_overrides]u21 = [_]u21{0} ** max_width_overrides;
+var narrow_override_count: usize = 0;
+
+fn setOverrideList(dst: []u21, count: *usize, cps: []const u21) void {
+    const n = @min(cps.len, dst.len);
+    @memcpy(dst[0..n], cps[0..n]);
+    std.mem.sort(u21, dst[0..n], {}, std.sort.asc(u21));
+    count.* = n;
+}
+
+/// 设置宽度覆盖名单（内部排序以支持二分查找；超出上限部分忽略）
+pub fn setWidthOverrides(wide_cps: []const u21, narrow_cps: []const u21) void {
+    setOverrideList(&wide_overrides, &wide_override_count, wide_cps);
+    setOverrideList(&narrow_overrides, &narrow_override_count, narrow_cps);
+}
+
+fn inSortedList(list: []const u21, cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid] == cp) return true;
+        if (list[mid] < cp) lo = mid + 1 else hi = mid;
+    }
+    return false;
+}
+
+/// 终端实际推进列数（与用户覆盖无关——终端不认识覆盖名单）：
+/// 真宽字符恒 2；模糊宽度字符取决于终端（ambiguous_terminal_wide）；
+/// 其余为 1。渲染层据此对「记账 2 列、终端推 1 列」的字符补续格空格
+/// （见 terminal/mod.zig 的 flush）。
+pub fn terminalAdvance(cp: u21, ambiguous_terminal_wide: bool) u2 {
+    if (inRanges(&wide, cp)) return 2;
+    if (inRanges(&ambiguous, cp)) return if (ambiguous_terminal_wide) 2 else 1;
+    return 1;
+}
+
+/// 宽容处理非法 UTF-8 字节（按替换字符计 1 列）
 pub fn stringWidth(bytes: []const u8) usize {
     var total: usize = 0;
     var i: usize = 0;
@@ -341,7 +589,84 @@ test "box drawing stays narrow" {
     try std.testing.expectEqual(@as(u2, 1), codepointWidth('█'));
     try std.testing.expectEqual(@as(u2, 1), codepointWidth('▀'));
     try std.testing.expectEqual(@as(u2, 1), codepointWidth('⣿'));
+}
+
+test "ambiguous width treated as wide(2)" {
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('①')); // U+2460
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth(0x24EB)); // ⓫（注意 U+24EA ⓪ 官方为 Neutral，保持 1）
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth(0x24EA));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('←'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('≤'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('°'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('α'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('…'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('Ⅰ'));
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth(0xFFFD));
+
+    try std.testing.expect(isAmbiguous('①'));
+    try std.testing.expect(isAmbiguous('…'));
+    try std.testing.expect(!isAmbiguous(0x2500));
+    try std.testing.expect(!isAmbiguous('a'));
+    try std.testing.expect(!isAmbiguous('中'));
+}
+
+test "ambiguous width policy: narrow(1) 切换与恢复" {
+    const saved = ambiguous_width;
+    defer ambiguous_width = saved;
+
+    ambiguous_width = .narrow;
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth('①'));
     try std.testing.expectEqual(@as(u2, 1), codepointWidth('…'));
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth('→'));
+    // 真宽字符与盒绘线不受策略影响
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('中'));
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth(0x1F600));
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth('─'));
+    // stringWidth / truncateToWidth 跟随策略
+    try std.testing.expectEqual(@as(usize, 3), stringWidth("①ab"));
+    try std.testing.expectEqualStrings("①", truncateToWidth("①②", 1));
+
+    ambiguous_width = .wide;
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('①'));
+    try std.testing.expectEqual(@as(usize, 4), stringWidth("①ab"));
+    try std.testing.expectEqualStrings("", truncateToWidth("①②", 1));
+}
+
+test "width overrides: 名单优先于策略，真宽字符不被 narrow 收缩" {
+    const saved_policy = ambiguous_width;
+    defer ambiguous_width = saved_policy;
+    defer setWidthOverrides(&[_]u21{}, &[_]u21{});
+
+    // 策略 wide：narrow 覆盖要把 — (U+2014) 压窄；wide 覆盖把 ④ (U+2463) 提宽
+    ambiguous_width = .wide;
+    setWidthOverrides(&[_]u21{0x2463}, &[_]u21{0x2014});
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth(0x2463)); // 覆盖为宽
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth(0x2460)); // 策略宽（未覆盖）
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth(0x2014)); // 覆盖为窄（策略本是宽）
+
+    // 策略 narrow：wide 覆盖把 ① 提宽
+    ambiguous_width = .narrow;
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth(0x2463));
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth(0x2460));
+
+    // 真宽字符不受 narrow 覆盖影响（终端固定 2 列）
+    setWidthOverrides(&[_]u21{}, &[_]u21{0x4E2D});
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('中'));
+
+    // 全自由度：任何字符可覆盖为宽；stringWidth/truncateToWidth 跟随
+    setWidthOverrides(&[_]u21{'A'}, &[_]u21{});
+    try std.testing.expectEqual(@as(u2, 2), codepointWidth('A'));
+    try std.testing.expectEqual(@as(usize, 4), stringWidth("Aab"));
+    try std.testing.expectEqualStrings("", truncateToWidth("A", 1));
+}
+
+test "terminalAdvance：真宽恒 2；模糊看终端；其余 1" {
+    try std.testing.expectEqual(@as(u2, 2), terminalAdvance('中', false));
+    try std.testing.expectEqual(@as(u2, 2), terminalAdvance('日', true));
+    try std.testing.expectEqual(@as(u2, 1), terminalAdvance(0x2014, false));
+    try std.testing.expectEqual(@as(u2, 2), terminalAdvance(0x2014, true));
+    try std.testing.expectEqual(@as(u2, 1), terminalAdvance('a', false));
+    try std.testing.expectEqual(@as(u2, 1), terminalAdvance('a', true));
 }
 
 test "string width" {

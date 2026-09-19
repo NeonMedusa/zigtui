@@ -6,6 +6,8 @@ pub const codepointWidth = @import("width.zig").codepointWidth;
 pub const stringWidth = @import("width.zig").stringWidth;
 pub const truncateToWidth = @import("width.zig").truncateToWidth;
 const decodeCharAt = @import("width.zig").decodeCharAt;
+/// 供宿主配置模糊宽度策略（width_mod.ambiguous_width: wide/narrow）
+pub const width_mod = @import("width.zig");
 
 pub const Cell = struct {
     char: u21 = ' ',
