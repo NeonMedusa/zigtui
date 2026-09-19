@@ -220,15 +220,16 @@ fn combineSurrogates(hi: u16, lo: u16) ?u21 {
 /// 把一条 KEY_EVENT 的 `UnicodeChar`（UTF-16 码元）转换为应喂给输入解析器的
 /// UTF-8 字节，写入 `out` 并返回字节数（0 = 该记录被吞掉，如未配对的前导代理）。
 ///
-/// 背景（ConPTY 实测）：conhost 的 VtInputThread 会先把收到的字节流按 UTF-8
-/// 解码为 UTF-16 再写入输入记录，因此记录**携带的永远是 UTF-16 码元**：
-/// - ASCII（≤ 0x7F）：码元值与字节相同，直接透传（控制序列/鼠标上报依赖此路径）；
+/// 背景（ConPTY 实测 + 上游源码核实）：conhost 的 VtInputThread 会先把伪控制台
+/// 收到的字节流按 UTF-8 解码为 UTF-16 再写入输入记录，因此记录**携带的永远是
+/// UTF-16 码元**：
+/// - ASCII（≤ 0x7F）：码元值与字节相同，直接透传（控制序列/鼠标上报等依赖此路径）；
 /// - BMP 非 ASCII（含中文）：UTF-8 编码后喂入；
 /// - 非 BMP（emoji 等）：以**前导+后继两条记录**到达，`pending_high` 缓存前导，
 ///   与后继合并成完整码点后再编码（与微软 terminalInput.cpp 的 _leadingSurrogate
-///   逻辑一致）。代理码元单独编码会失败并被静默丢弃 → 输入/粘贴 emoji 无效；
-/// - U+0080–U+00FF（é、ü 等 Latin-1 补充）：若被当作"原始字节"透传，
-///   单字节不构成合法 UTF-8 序列，会静默丢弃该字符甚至吞掉后续字符；故统一编码。
+///   逻辑一致）。此前代理码元单独编码会失败并被静默丢弃 → 输入/粘贴 emoji 无效；
+/// - U+0080–U+00FF（é、ü 等 Latin-1 补充）：此前被误当作"原始字节"透传，
+///   单字节不构成合法 UTF-8 序列，会静默丢弃该字符甚至吞掉后续字符；现统一编码。
 fn codeUnitToUtf8(pending_high: *u16, unit: u16, out: *[4]u8) usize {
     if (unit == 0) return 0;
     if (unit >= 0xD800 and unit <= 0xDBFF) {
@@ -668,6 +669,8 @@ pub const WindowsBackend = struct {
 test "combineSurrogates: valid pairs and boundaries" {
     // 😀 U+1F600 = D83D DE00
     try std.testing.expectEqual(@as(?u21, 0x1F600), combineSurrogates(0xD83D, 0xDE00));
+    // 🚀 U+1F680 = D83D DE80
+    try std.testing.expectEqual(@as(?u21, 0x1F680), combineSurrogates(0xD83D, 0xDE80));
     // Boundary: U+10000 = D800 DC00, U+10FFFF = DBFF DFFF
     try std.testing.expectEqual(@as(?u21, 0x10000), combineSurrogates(0xD800, 0xDC00));
     try std.testing.expectEqual(@as(?u21, 0x10FFFF), combineSurrogates(0xDBFF, 0xDFFF));
