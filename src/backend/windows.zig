@@ -208,6 +208,48 @@ const WAIT_TIMEOUT: DWORD = 0x00000102;
 
 const UTF8_CODE_PAGE: UINT = 65001;
 
+/// Combines a UTF-16 surrogate pair into a code point. Returns null when
+/// either half is outside its surrogate range.
+fn combineSurrogates(hi: u16, lo: u16) ?u21 {
+    if (hi < 0xD800 or hi > 0xDBFF) return null;
+    if (lo < 0xDC00 or lo > 0xDFFF) return null;
+    return @intCast(0x10000 + ((@as(u21, hi) - 0xD800) << 10) + (@as(u21, lo) - 0xDC00));
+}
+
+/// Result of feeding one `KEY_EVENT_RECORD.UnicodeChar` code unit into the
+/// surrogate state machine.
+const SurrogateStep = union(enum) {
+    /// A leading surrogate was buffered; emit no event.
+    pending,
+    /// A complete code point is ready.
+    cp: u21,
+    /// Nothing to emit for this unit (trailing surrogate without a leader).
+    none,
+};
+
+/// UTF-16 input arrives as code units: a non-BMP character (emoji) is delivered
+/// as two consecutive KEY_EVENTs, a leading surrogate followed by a trailing
+/// one. `pending` holds the leading half across calls; `unit` is the code unit
+/// just read. `pending` is always left cleared unless a new leader was stored.
+fn resolveSurrogate(pending: *u16, unit: u16) SurrogateStep {
+    if (unit >= 0xD800 and unit <= 0xDBFF) {
+        pending.* = unit;
+        return .pending;
+    }
+    if (unit >= 0xDC00 and unit <= 0xDFFF) {
+        const hi = pending.*;
+        pending.* = 0;
+        if (hi != 0) {
+            if (combineSurrogates(hi, unit)) |cp| return .{ .cp = cp };
+        }
+        return .none;
+    }
+    // Any other unit: a stray leader never combines, so drop it and let the
+    // caller process this unit normally.
+    pending.* = 0;
+    return .none;
+}
+
 pub const WindowsBackend = struct {
     allocator: Allocator,
     stdin_handle: HANDLE,
@@ -218,6 +260,9 @@ pub const WindowsBackend = struct {
     in_alternate_screen: bool = false,
     mouse_enabled: bool = false,
     write_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// Leading UTF-16 surrogate buffered while waiting for its trailing half
+    /// (see `resolveSurrogate`). 0 = none pending.
+    pending_high_surrogate: u16 = 0,
     original_console_info: CONSOLE_SCREEN_BUFFER_INFO = undefined,
     original_codepage: UINT = undefined,
 
@@ -514,6 +559,15 @@ pub const WindowsBackend = struct {
                     .shift = shift_pressed,
                 };
 
+                // Non-BMP input (emoji) is split across two KEY_EVENTs; combine
+                // the surrogate halves before the code-unit guard below, which
+                // would otherwise reject both.
+                switch (resolveSurrogate(&self.pending_high_surrogate, key_event.uChar.UnicodeChar)) {
+                    .pending => return events.Event.none,
+                    .cp => |cp| return events.Event{ .key = .{ .code = .{ .char = cp }, .modifiers = modifiers } },
+                    .none => {},
+                }
+
                 // Map virtual key codes to KeyCode
                 const key_code: events.KeyCode = switch (key_event.wVirtualKeyCode) {
                     VK_RETURN => .enter,
@@ -532,9 +586,10 @@ pub const WindowsBackend = struct {
                     VK_INSERT => .insert,
                     VK_F1...VK_F1 + 11 => |vk| .{ .f = @intCast(vk - VK_F1 + 1) },
                     else => blk: {
-                        // Use the Unicode character if available
+                        // Use the Unicode character if available (surrogates
+                        // never reach this point; see `resolveSurrogate`).
                         const unicode_char = key_event.uChar.UnicodeChar;
-                        if (unicode_char > 0 and unicode_char < 0xD800) {
+                        if (unicode_char > 0 and (unicode_char < 0xD800 or unicode_char > 0xDFFF)) {
                             break :blk .{ .char = unicode_char };
                         }
                         return events.Event.none;
@@ -674,3 +729,45 @@ pub const WindowsBackend = struct {
         self.mouse_enabled = false;
     }
 };
+
+test "combineSurrogates: valid pairs and boundaries" {
+    // 😀 U+1F600 = D83D DE00
+    try std.testing.expectEqual(@as(?u21, 0x1F600), combineSurrogates(0xD83D, 0xDE00));
+    // Boundary: U+10000 = D800 DC00, U+10FFFF = DBFF DFFF
+    try std.testing.expectEqual(@as(?u21, 0x10000), combineSurrogates(0xD800, 0xDC00));
+    try std.testing.expectEqual(@as(?u21, 0x10FFFF), combineSurrogates(0xDBFF, 0xDFFF));
+    // Non-surrogate halves are rejected
+    try std.testing.expectEqual(@as(?u21, null), combineSurrogates(0x0041, 0xDE00));
+    try std.testing.expectEqual(@as(?u21, null), combineSurrogates(0xD83D, 0x0041));
+    try std.testing.expectEqual(@as(?u21, null), combineSurrogates(0xDC00, 0xDC00));
+}
+
+test "resolveSurrogate: pairs, stray leaders and lone trailers" {
+    var pending: u16 = 0;
+
+    // 😀 U+1F600: leader is buffered, trailer completes it
+    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
+    try std.testing.expectEqual(@as(u16, 0xD83D), pending);
+    try std.testing.expectEqual(SurrogateStep{ .cp = 0x1F600 }, resolveSurrogate(&pending, 0xDE00));
+    try std.testing.expectEqual(@as(u16, 0), pending);
+
+    // Stray leader followed by a normal character: leader is dropped, the
+    // character is processed normally by the caller
+    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
+    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 'x'));
+    try std.testing.expectEqual(@as(u16, 0), pending);
+
+    // Lone trailer: nothing to emit, no state left behind
+    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 0xDE00));
+    try std.testing.expectEqual(@as(u16, 0), pending);
+
+    // Two leaders in a row: the second replaces the first
+    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83D));
+    try std.testing.expectEqual(SurrogateStep.pending, resolveSurrogate(&pending, 0xD83C));
+    try std.testing.expectEqual(@as(u16, 0xD83C), pending);
+    // 🏏 U+1F3CF = D83C DFCF
+    try std.testing.expectEqual(SurrogateStep{ .cp = 0x1F3CF }, resolveSurrogate(&pending, 0xDFCF));
+
+    // Plain ASCII passes through the machine untouched
+    try std.testing.expectEqual(SurrogateStep.none, resolveSurrogate(&pending, 'a'));
+}
