@@ -4,6 +4,7 @@ const style = @import("../style/mod.zig");
 const Rect = render.Rect;
 const Buffer = render.Buffer;
 const Style = style.Style;
+const codepointWidth = render.codepointWidth;
 
 pub const Tabs = struct {
     titles: []const []const u8,
@@ -45,13 +46,16 @@ pub const Tabs = struct {
                 x += 1;
             }
 
-            // Title characters
+            // Title characters: advance by display width so a wide glyph is
+            // not written into the previous character's trailing cell.
             var view = std.unicode.Utf8View.initUnchecked(title);
             var iter = view.iterator();
             while (iter.nextCodepoint()) |cp| {
-                if (x >= area.x + area.width) break;
+                const w: u16 = @intCast(codepointWidth(cp));
+                if (w == 0) continue;
+                if (x + w > area.x + area.width) break;
                 buf.setChar(x, y, cp, tab_style);
-                x += 1;
+                x += w;
             }
 
             // Right padding
@@ -96,4 +100,39 @@ test "Tabs selectPrevious wraps" {
     var tabs = Tabs{ .titles = &.{ "A", "B", "C" }, .selected = 0 };
     tabs.selectPrevious();
     try std.testing.expectEqual(@as(usize, 2), tabs.selected);
+}
+
+test "Tabs renders wide characters without clobbering them" {
+    var buf = try render.Buffer.init(std.testing.allocator, 24, 1);
+    defer buf.deinit();
+
+    const tabs = Tabs{
+        .titles = &.{ "中文", "B" },
+        .selected = 0,
+        .padding = 0,
+    };
+    tabs.render(.{ .x = 0, .y = 0, .width = 24, .height = 1 }, &buf);
+
+    // "中文" occupies columns 0-3, then the divider, then "B".
+    try std.testing.expectEqual(@as(u21, 0x4E2D), buf.get(0, 0).?.char);
+    try std.testing.expectEqual(@as(u2, 2), buf.get(0, 0).?.width);
+    try std.testing.expectEqual(@as(u2, 0), buf.get(1, 0).?.width); // continuation
+    try std.testing.expectEqual(@as(u21, 0x6587), buf.get(2, 0).?.char);
+    try std.testing.expectEqual(@as(u2, 2), buf.get(2, 0).?.width);
+    try std.testing.expectEqual(@as(u2, 0), buf.get(3, 0).?.width); // continuation
+    try std.testing.expectEqual(@as(u21, 0x2502), buf.get(4, 0).?.char); // │
+    try std.testing.expectEqual(@as(u21, 'B'), buf.get(5, 0).?.char);
+}
+
+test "Tabs stops before a wide character that would straddle the edge" {
+    var buf = try render.Buffer.init(std.testing.allocator, 3, 1);
+    defer buf.deinit();
+
+    const tabs = Tabs{ .titles = &.{"中"}, .padding = 0 };
+    tabs.render(.{ .x = 0, .y = 0, .width = 3, .height = 1 }, &buf);
+
+    // 2-column glyph at column 0 fits; a second one would need columns 2-3
+    // but the area is only 3 wide, so it must not be written.
+    try std.testing.expectEqual(@as(u21, 0x4E2D), buf.get(0, 0).?.char);
+    try std.testing.expectEqual(@as(u21, ' '), buf.get(2, 0).?.char);
 }
