@@ -20,6 +20,12 @@ pub fn TextInput(comptime max_bytes: usize) type {
         cursor_style: Style = .{},
         placeholder: []const u8 = "",
         placeholder_style: Style = .{},
+        /// 是否绘制应用层方块光标。宿主用真实终端光标时置 false
+        /// （否则会出现两个光标；坐标用 cursorScreenPos 计算）
+        draw_fake_cursor: bool = true,
+        /// 选区字节范围 [lo, hi)（由外部设置；null 表示无选区）。
+        /// 与 TextArea.sel_range 同语义，用于 Ctrl+A 全选 / 剪切 / 拖选高亮。
+        sel_range: ?[2]usize = null,
 
         /// Return the current text as a slice.
         pub fn value(self: *const Self) []const u8 {
@@ -30,6 +36,62 @@ pub fn TextInput(comptime max_bytes: usize) type {
         pub fn clear(self: *Self) void {
             self.len = 0;
             self.cursor = 0;
+            self.sel_range = null;
+        }
+
+        /// 选中全部文本（光标置尾，与 TextArea 语义一致）
+        pub fn selectAll(self: *Self) void {
+            if (self.len == 0) {
+                self.sel_range = null;
+                return;
+            }
+            self.sel_range = .{ 0, self.len };
+            self.cursor = self.len;
+        }
+
+        /// 删除 [lo, hi) 区间（光标落在 lo）；无选区时无操作
+        pub fn deleteRange(self: *Self, lo: usize, hi: usize) void {
+            const a = @min(lo, self.len);
+            const b = @min(hi, self.len);
+            if (b <= a) return;
+            std.mem.copyForwards(u8, self.buf[a .. self.len - (b - a)], self.buf[b..self.len]);
+            self.len -= b - a;
+            self.cursor = a;
+            self.sel_range = null;
+        }
+
+        /// 当前选区字节范围（两端排序、越界裁剪）；无有效选区返回 null
+        pub fn selectionRange(self: *const Self) ?[2]usize {
+            const r = self.sel_range orelse return null;
+            const a = @min(r[0], self.len);
+            const b = @min(r[1], self.len);
+            const lo = @min(a, b);
+            const hi = @max(a, b);
+            if (hi <= lo) return null;
+            return .{ lo, hi };
+        }
+
+        /// 删除当前选区（无选区时无操作）
+        pub fn deleteSelection(self: *Self) void {
+            if (self.selectionRange()) |r| self.deleteRange(r[0], r[1]);
+        }
+
+        /// 方向键折叠选区（主流编辑器语义）：左/上折叠到左边缘、右/下折叠到右边缘。
+        /// 清除选区并把光标移到边缘，返回 true 表示存在有效选区并已折叠
+        /// （调用方不要再移动光标）。无选区/空选区返回 false。
+        pub fn collapseSelection(self: *Self, to_right: bool) bool {
+            const r = self.selectionRange() orelse {
+                self.sel_range = null;
+                return false;
+            };
+            self.sel_range = null;
+            self.cursor = if (to_right) r[1] else r[0];
+            return true;
+        }
+
+        fn isSelected(self: *const Self, off: usize) bool {
+            const r = self.sel_range orelse return false;
+            return off >= r[0] and off < r[1];
         }
 
         /// Insert a Unicode codepoint at the cursor position.
@@ -41,6 +103,8 @@ pub fn TextInput(comptime max_bytes: usize) type {
 
         /// Insert raw bytes (must be valid UTF-8) at the cursor.
         pub fn insertBytes(self: *Self, bytes: []const u8) void {
+            // 有选区：插入即替换选中内容（与 TextArea 的输入替换语义一致）
+            if (self.selectionRange()) |r| self.deleteRange(r[0], r[1]);
             if (self.len + bytes.len > max_bytes) return;
             // Shift existing content right to make room
             if (self.cursor < self.len) {
@@ -57,6 +121,10 @@ pub fn TextInput(comptime max_bytes: usize) type {
 
         /// Delete the codepoint immediately before the cursor (backspace).
         pub fn deleteBackward(self: *Self) void {
+            if (self.selectionRange()) |r| {
+                self.deleteRange(r[0], r[1]);
+                return;
+            }
             if (self.cursor == 0) return;
             const cp_len = self.prevCodepointLen();
             const new_cursor = self.cursor - cp_len;
@@ -67,6 +135,10 @@ pub fn TextInput(comptime max_bytes: usize) type {
 
         /// Delete the codepoint immediately after the cursor (delete key).
         pub fn deleteForward(self: *Self) void {
+            if (self.selectionRange()) |r| {
+                self.deleteRange(r[0], r[1]);
+                return;
+            }
             if (self.cursor >= self.len) return;
             const cp_len = self.nextCodepointLen();
             std.mem.copyForwards(u8, self.buf[self.cursor .. self.len - cp_len], self.buf[self.cursor + cp_len .. self.len]);
@@ -74,21 +146,34 @@ pub fn TextInput(comptime max_bytes: usize) type {
         }
 
         pub fn moveCursorLeft(self: *Self) void {
+            self.sel_range = null;
             if (self.cursor == 0) return;
             self.cursor -= self.prevCodepointLen();
         }
 
         pub fn moveCursorRight(self: *Self) void {
+            self.sel_range = null;
             if (self.cursor >= self.len) return;
             self.cursor += self.nextCodepointLen();
         }
 
         pub fn moveCursorHome(self: *Self) void {
+            self.sel_range = null;
             self.cursor = 0;
         }
 
         pub fn moveCursorEnd(self: *Self) void {
+            self.sel_range = null;
             self.cursor = self.len;
+        }
+
+        /// 把光标设到指定字节偏移（自动裁剪到合法范围并对齐码点边界）
+        pub fn setCursor(self: *Self, off: usize) void {
+            self.sel_range = null;
+            var o = @min(off, self.len);
+            // 回退到码点起始字节（不能停在 UTF-8 连续字节上）
+            while (o > 0 and o < self.len and (self.buf[o] & 0xC0) == 0x80) o -= 1;
+            self.cursor = o;
         }
 
         pub fn render(self: *const Self, area: Rect, buf: *Buffer) void {
@@ -138,10 +223,14 @@ pub fn TextInput(comptime max_bytes: usize) type {
                 }
                 if (x + @as(u16, @intCast(w)) > area.x + area.width) break;
 
-                const is_cursor = self.focused and col == cursor_col;
+                const is_cursor = self.draw_fake_cursor and self.focused and col == cursor_col;
+                const selected = self.isSelected(i);
                 if (is_cursor) {
                     buf.setChar(x, area.y, d.cp, self.style.merge(self.cursor_style));
                     cursor_drawn = true;
+                } else if (selected) {
+                    // 选区高亮（与 TextArea 同风格：反色）
+                    buf.setChar(x, area.y, d.cp, self.style.merge(.{ .modifier = .{ .reversed = true } }));
                 } else {
                     buf.setChar(x, area.y, d.cp, self.style);
                 }
@@ -151,7 +240,7 @@ pub fn TextInput(comptime max_bytes: usize) type {
             }
 
             // Cursor at end-of-text (or on a scrolled-into-view column).
-            if (self.focused and !cursor_drawn and x < area.x + area.width) {
+            if (self.draw_fake_cursor and self.focused and !cursor_drawn and x < area.x + area.width) {
                 buf.setChar(x, area.y, ' ', self.style.merge(self.cursor_style));
                 x += 1;
             }
@@ -160,6 +249,25 @@ pub fn TextInput(comptime max_bytes: usize) type {
             while (x < area.x + area.width) : (x += 1) {
                 buf.setChar(x, area.y, ' ', self.style);
             }
+        }
+
+        /// 光标在渲染区内的屏幕坐标（供宿主定位真实终端光标；参数与 render 一致）。
+        /// 与 render 的滚动逻辑保持一致：光标列超出宽度时向左滚动（cursor_col - width + 1）。
+        /// 需将 draw_fake_cursor 置 false，否则会出现两个光标。
+        pub fn cursorScreenPos(self: *const Self, area: Rect) ?[2]u16 {
+            if (area.width == 0 or area.height == 0) return null;
+            const text = self.value();
+            var cursor_col: usize = 0;
+            var i: usize = 0;
+            while (i < self.cursor and i < text.len) {
+                const d = decodeAt(text, i);
+                cursor_col += codepointWidth(d.cp);
+                i += d.len;
+            }
+            const width: usize = area.width;
+            const scroll: usize = if (cursor_col >= width) cursor_col - width + 1 else 0;
+            const col = cursor_col - scroll;
+            return .{ area.x +| @as(u16, @intCast(@min(col, 0xFFFF))), area.y };
         }
 
         // ── Private helpers ───────────────────────────────────────────────────
@@ -189,6 +297,51 @@ pub fn TextInput(comptime max_bytes: usize) type {
             return @min(seq_len, self.len - self.cursor);
         }
     };
+}
+
+test "TextInput selection: collapse to edge on arrow keys" {
+    var input = TextInput(64){};
+    input.insertBytes("hello world");
+
+    // 左折：光标到左边缘
+    input.cursor = 5;
+    input.sel_range = .{ 2, 8 };
+    try std.testing.expect(input.collapseSelection(false));
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+    try std.testing.expect(input.sel_range == null);
+
+    // 右折：光标到右边缘
+    input.sel_range = .{ 2, 8 };
+    try std.testing.expect(input.collapseSelection(true));
+    try std.testing.expectEqual(@as(usize, 8), input.cursor);
+    try std.testing.expect(input.sel_range == null);
+
+    // 反向区间：按数值边缘
+    input.sel_range = .{ 8, 2 };
+    try std.testing.expect(input.collapseSelection(false));
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+
+    // 无选区：返回 false
+    try std.testing.expect(!input.collapseSelection(true));
+}
+
+test "TextInput cursorScreenPos follows cursor and scroll" {
+    var input = TextInput(64){};
+    input.insertBytes("hello");
+    // 光标在末尾（列 5）：x = 2 + 5 = 7
+    var pos = input.cursorScreenPos(.{ .x = 2, .y = 3, .width = 10, .height = 1 }).?;
+    try std.testing.expectEqual(@as(u16, 7), pos[0]);
+    try std.testing.expectEqual(@as(u16, 3), pos[1]);
+
+    // 光标移到行首：x = 2
+    input.moveCursorHome();
+    pos = input.cursorScreenPos(.{ .x = 2, .y = 3, .width = 10, .height = 1 }).?;
+    try std.testing.expectEqual(@as(u16, 2), pos[0]);
+
+    // 宽度 4、光标列 5：scroll = 2 → col 3 → x = 3
+    input.moveCursorEnd();
+    pos = input.cursorScreenPos(.{ .x = 0, .y = 0, .width = 4, .height = 1 }).?;
+    try std.testing.expectEqual(@as(u16, 3), pos[0]);
 }
 
 test "TextInput insert and delete" {
@@ -221,6 +374,41 @@ test "TextInput insert in middle" {
     input.moveCursorLeft();
     input.insertCodepoint('B');
     try std.testing.expectEqualStrings("ABC", input.value());
+}
+
+test "TextInput selection: selectAll / deleteSelection / insert replaces" {
+    var input = TextInput(64){};
+    input.insertBytes("sk-abc123");
+    input.selectAll();
+    try std.testing.expectEqual(@as(usize, 9), input.selectionRange().?[1]);
+    input.deleteSelection();
+    try std.testing.expectEqualStrings("", input.value());
+    try std.testing.expectEqual(@as(usize, 0), input.cursor);
+
+    // 插入替换选区
+    input.insertBytes("old");
+    input.selectAll();
+    input.insertBytes("new");
+    try std.testing.expectEqualStrings("new", input.value());
+
+    // backspace 删除选区
+    input.selectAll();
+    input.deleteBackward();
+    try std.testing.expectEqualStrings("", input.value());
+}
+
+test "TextInput selection: deleteRange clamps and clears sel" {
+    var input = TextInput(64){};
+    input.insertBytes("abcdef");
+    input.sel_range = .{ 2, 4 };
+    input.deleteRange(2, 4);
+    try std.testing.expectEqualStrings("abef", input.value());
+    try std.testing.expectEqual(@as(usize, 2), input.cursor);
+    try std.testing.expect(input.sel_range == null);
+    // 越界裁剪
+    input.sel_range = .{ 1, 999 };
+    input.deleteSelection();
+    try std.testing.expectEqualStrings("a", input.value());
 }
 
 test "TextInput renders wide characters at correct columns" {
