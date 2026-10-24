@@ -271,7 +271,7 @@ pub const Terminal = struct {
     /// 请求终端改变光标形状（立即写出）。
     pub fn setCursorShape(self: *Terminal, shape: CursorShape) !void {
         var buf: [8]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "\x1b[{d} q", .{@intFromEnum(shape)}) catch unreachable;
+        const cmd = std.fmt.bufPrint(&buf, "\x1b[{d} q", .{@backingInt(shape)}) catch unreachable;
         try self.backend_impl.write(cmd);
         try self.backend_impl.flush();
     }
@@ -314,7 +314,7 @@ pub const Terminal = struct {
 const testing = std.testing;
 
 const MockBackend = struct {
-    written: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    written: std.ArrayListUnmanaged(u8) = .empty,
 
     fn enterRawMode(_: *anyopaque) Error!void {}
     fn exitRawMode(_: *anyopaque) Error!void {}

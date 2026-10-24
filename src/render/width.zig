@@ -489,7 +489,6 @@ pub fn decodeCharAt(bytes: []const u8, index: usize) DecodedChar {
 
 /// Display width of `bytes` in columns. Malformed UTF-8 counts as the
 /// replacement character (one column), matching how it is rendered.
-
 /// 是否属于「模糊宽度」字符类（与当前策略无关；策略见 ambiguous_width）。
 pub fn isAmbiguous(cp: u21) bool {
     return inRanges(&ambiguous, cp);
@@ -499,9 +498,9 @@ pub fn isAmbiguous(cp: u21) bool {
 /// 由宿主（SkyNet）在启动时按 config.json 的 width_overrides 设置。
 pub const max_width_overrides = 1024;
 
-var wide_overrides: [max_width_overrides]u21 = [_]u21{0} ** max_width_overrides;
+var wide_overrides: [max_width_overrides]u21 = @splat(0);
 var wide_override_count: usize = 0;
-var narrow_overrides: [max_width_overrides]u21 = [_]u21{0} ** max_width_overrides;
+var narrow_overrides: [max_width_overrides]u21 = @splat(0);
 var narrow_override_count: usize = 0;
 
 fn setOverrideList(dst: []u21, count: *usize, cps: []const u21) void {

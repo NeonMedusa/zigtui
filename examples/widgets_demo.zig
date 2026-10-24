@@ -79,7 +79,7 @@ const AppState = struct {
     tick: u64 = 0,
 
     // Sparkline
-    spark_data: [80]f64 = [_]f64{0} ** 80,
+    spark_data: [80]f64 = @splat(0),
     spark_head: usize = 0,
 
     // BarChart
